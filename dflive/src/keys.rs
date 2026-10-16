@@ -8,19 +8,28 @@
 use serde_json::{json, Value};
 use std::process::Command;
 
-/// Run a system command and record exactly what it said.
-fn run(program: &str, args: &[&str]) -> Value {
+/// Run a system command, record exactly what it said, and note it in the
+/// footprint log.
+pub(crate) fn run(program: &str, args: &[&str]) -> Value {
+    let command = std::iter::once(program)
+        .chain(args.iter().copied())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let started = crate::now_rfc3339();
     match Command::new(program).args(args).output() {
-        Ok(out) => json!({
-            "command": std::iter::once(program).chain(args.iter().copied()).collect::<Vec<_>>().join(" "),
-            "exit": out.status.code(),
-            "stdout": String::from_utf8_lossy(&out.stdout),
-            "stderr": String::from_utf8_lossy(&out.stderr),
-        }),
-        Err(e) => json!({
-            "command": std::iter::once(program).chain(args.iter().copied()).collect::<Vec<_>>().join(" "),
-            "error": e.to_string(),
-        }),
+        Ok(out) => {
+            crate::footprint::child(&command, &started, out.status.code(), None);
+            json!({
+                "command": command,
+                "exit": out.status.code(),
+                "stdout": String::from_utf8_lossy(&out.stdout),
+                "stderr": String::from_utf8_lossy(&out.stderr),
+            })
+        }
+        Err(e) => {
+            crate::footprint::child(&command, &started, None, Some(&e.to_string()));
+            json!({ "command": command, "error": e.to_string() })
+        }
     }
 }
 

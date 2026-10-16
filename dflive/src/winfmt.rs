@@ -150,6 +150,45 @@ pub fn neighbor_state(n: i32) -> &'static str {
     }
 }
 
+/// GetDriveTypeW
+pub fn drive_type(n: u32) -> &'static str {
+    match n {
+        1 => "no_root_dir",
+        2 => "removable",
+        3 => "fixed",
+        4 => "remote",
+        5 => "cdrom",
+        6 => "ramdisk",
+        _ => "unknown",
+    }
+}
+
+/// STORAGE_BUS_TYPE
+pub fn bus_type(n: i32) -> &'static str {
+    match n {
+        1 => "SCSI",
+        2 => "ATAPI",
+        3 => "ATA",
+        4 => "1394",
+        5 => "SSA",
+        6 => "FibreChannel",
+        7 => "USB",
+        8 => "RAID",
+        9 => "iSCSI",
+        10 => "SAS",
+        11 => "SATA",
+        12 => "SD",
+        13 => "MMC",
+        14 => "Virtual",
+        15 => "FileBackedVirtual",
+        16 => "Spaces",
+        17 => "NVMe",
+        18 => "SCM",
+        19 => "UFS",
+        _ => "unknown",
+    }
+}
+
 /// UTF-16 up to the first NUL
 pub fn utf16(buf: &[u16]) -> String {
     let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
@@ -206,6 +245,9 @@ mod tests {
         assert_eq!(tcp_state(2), "LISTEN");
         assert_eq!(service_state(4), "running");
         assert_eq!(session_state(0), "active");
+        assert_eq!(drive_type(4), "remote");
+        assert_eq!(bus_type(7), "USB");
+        assert_eq!(bus_type(17), "NVMe");
         assert_eq!(
             mac(&[0, 0x1b, 0x21, 0xaa, 0xbb, 0xcc]).as_deref(),
             Some("00:1b:21:aa:bb:cc")

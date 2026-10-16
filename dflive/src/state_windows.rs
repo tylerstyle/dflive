@@ -218,7 +218,10 @@ fn token_owner(process: HANDLE, accounts: &mut HashMap<String, Option<String>>) 
     }
 }
 
-fn command_line(process: HANDLE) -> Option<String> {
+/// The command line through ProcessCommandLineInformation: `Ok(None)` when the
+/// process has none (System, Registry), `Err` when the query fails (Windows
+/// before 8.1, Wine), so only then the PEB is read
+fn command_line(process: HANDLE) -> Result<Option<String>, i32> {
     #[repr(C)]
     struct UnicodeString {
         length: u16,
@@ -247,20 +250,23 @@ fn command_line(process: HANDLE) -> Option<String> {
             }
             tries += 1;
             if !TOO_SMALL.contains(&(st as u32)) || tries > 4 {
-                return None;
+                return Err(st);
             }
             size = len.max(size.saturating_mul(4));
         }
         let us = &*(buf.as_ptr() as *const UnicodeString);
         let start = us.buffer as usize;
         let (lo, hi) = (buf.as_ptr() as usize, buf.as_ptr() as usize + buf.len() * 8);
-        if us.buffer.is_null() || start < lo || start + us.length as usize > hi {
-            return None;
+        if us.length == 0 || us.buffer.is_null() {
+            return Ok(None);
         }
-        Some(String::from_utf16_lossy(std::slice::from_raw_parts(
+        if start < lo || start + us.length as usize > hi {
+            return Err(0);
+        }
+        Ok(Some(String::from_utf16_lossy(std::slice::from_raw_parts(
             us.buffer,
             us.length as usize / 2,
-        )))
+        ))))
     }
 }
 
@@ -396,7 +402,7 @@ pub fn processes(hash: bool) -> Vec<Value> {
                 m.insert("exe_sha256".into(), json!(exe_sha256));
                 m.insert(
                     "cmdline".into(),
-                    json!(command_line(h).or_else(|| command_line_from_peb(pid))),
+                    json!(command_line(h).unwrap_or_else(|_| command_line_from_peb(pid))),
                 );
                 m.insert("start".into(), json!(start));
                 m.insert("user_sid".into(), json!(owner.sid));
@@ -798,44 +804,52 @@ fn reg_dword(key: &str, value: &str) -> Option<u32> {
     (r == 0).then_some(d)
 }
 
-/// Everything, as one JSON document (the same top-level names as on Linux
-/// where the meaning is the same).
-pub fn collect(hash_executables: bool) -> Value {
-    const CV: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
-    let mut m = Map::new();
-    m.insert("collected_at".into(), json!(crate::now_rfc3339()));
-    m.insert("host".into(), json!(crate::host_name()));
-    // SAFETY: RtlGetVersion and the time-zone query fill caller-owned structs
-    let (version, tz) = unsafe {
+const CURRENT_VERSION: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+
+/// Version (RtlGetVersion: not subject to compatibility shims) and product
+pub fn os_info() -> Value {
+    // SAFETY: RtlGetVersion fills a caller-owned struct
+    let version = unsafe {
         let mut v: OSVERSIONINFOW = zeroed();
         v.dwOSVersionInfoSize = size_of::<OSVERSIONINFOW>() as u32;
-        let version = (RtlGetVersion(&mut v) >= 0).then(|| {
+        (RtlGetVersion(&mut v) >= 0).then(|| {
             format!(
                 "{}.{}.{}",
                 v.dwMajorVersion, v.dwMinorVersion, v.dwBuildNumber
             )
-        });
+        })
+    };
+    json!({
+        "version": version,
+        "product": reg_string(CURRENT_VERSION, "ProductName"),
+        "display_version": reg_string(CURRENT_VERSION, "DisplayVersion"),
+        "update_revision": reg_dword(CURRENT_VERSION, "UBR"),
+    })
+}
+
+pub fn time_zone() -> Option<Value> {
+    // SAFETY: fills a caller-owned struct
+    unsafe {
         let mut tz: DYNAMIC_TIME_ZONE_INFORMATION = zeroed();
-        let tz_id = GetDynamicTimeZoneInformation(&mut tz);
-        let tz = (tz_id != u32::MAX).then(|| {
+        let id = GetDynamicTimeZoneInformation(&mut tz);
+        (id != u32::MAX).then(|| {
             json!({
                 "key": utf16(&tz.TimeZoneKeyName),
                 "bias_minutes": tz.Bias,
-                "daylight_saving_in_effect": tz_id == 2,
+                "daylight_saving_in_effect": id == 2,
             })
-        });
-        (version, tz)
-    };
-    m.insert(
-        "os".into(),
-        json!({
-            "version": version,
-            "product": reg_string(CV, "ProductName"),
-            "display_version": reg_string(CV, "DisplayVersion"),
-            "update_revision": reg_dword(CV, "UBR"),
-        }),
-    );
-    m.insert("time_zone".into(), json!(tz));
+        })
+    }
+}
+
+/// Everything, as one JSON document (the same top-level names as on Linux
+/// where the meaning is the same).
+pub fn collect(hash_executables: bool) -> Value {
+    let mut m = Map::new();
+    m.insert("collected_at".into(), json!(crate::now_rfc3339()));
+    m.insert("host".into(), json!(crate::host_name()));
+    m.insert("os".into(), os_info());
+    m.insert("time_zone".into(), json!(time_zone()));
     // SAFETY: no arguments
     let uptime_ms = unsafe { GetTickCount64() };
     let now = std::time::SystemTime::now()

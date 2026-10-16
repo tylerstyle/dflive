@@ -1,7 +1,8 @@
 # dflive.exe (the mingw cross build) under Wine: state must list the running
 # processes with command lines, owners and image hashes, and a TCP connection
 # held by `dflive.exe send` together with that process; keys must record that
-# manage-bde is missing instead of failing.
+# manage-bde is missing instead of failing; status must measure the clock and
+# list the volumes; the footprint log must record both runs.
 #
 #   nix-build tests/wine.nix
 { pkgs ? import <nixpkgs> { }
@@ -28,7 +29,9 @@ pkgs.runCommand "dflive-wine"
     done
 
     wine $exe state -o "Z:$PWD/state.json"
-    wine $exe keys -o "Z:$PWD/keys.json" --plaintext
+    ref=$(date -u -d '-30 seconds' +%Y-%m-%dT%H:%M:%SZ)
+    wine $exe status --reference-time "$ref" -o "Z:$PWD/status.json" --log "Z:$PWD/fp.jsonl"
+    wine $exe keys -o "Z:$PWD/keys.json" --plaintext --log "Z:$PWD/fp.jsonl"
     wineserver -k || true
 
     python3 - $exe <<'EOF'
@@ -59,8 +62,21 @@ pkgs.runCommand "dflive-wine"
     keys = json.load(open("keys.json"))
     assert keys["os"].startswith("windows"), keys
     assert keys["details"]["commands"][0].get("error"), keys
-    print("dflive.exe state and keys under Wine: OK")
+    status = json.load(open("status.json"))
+    assert 29 <= status["clock"]["offset_seconds"] <= 90, status["clock"]
+    assert status["system"]["os"]["version"], status["system"]
+    roots = [d.get("root") for d in status["disks"]]
+    assert "C:\\" in roots, status["disks"]
+    assert status["encryption"]["manage_bde_status"].get("error"), status["encryption"]
+
+    log = [json.loads(l) for l in open("fp.jsonl")]
+    assert [r["action"] for r in log] == ["status", "keys"], log
+    assert all(r["self"]["exe_sha256"] == want and r["self"]["kit"] is None for r in log), log
+    assert log[0]["written"][0]["path"].endswith("status.json"), log[0]
+    assert log[1]["children"][0]["command"] == "manage-bde -status", log[1]
+    assert log[1]["children"][0]["error"], log[1]
+    print("dflive.exe state, status, keys and the log under Wine: OK")
     EOF
     mkdir $out
-    cp state.json keys.json $out/
+    cp state.json keys.json status.json fp.jsonl $out/
   ''

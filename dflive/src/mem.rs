@@ -3,34 +3,14 @@
 //! while it is read), the tool's own hash, its exit status and the dump's
 //! SHA-256 recorded next to the dump.
 
+use crate::footprint::{self, sha256_file};
 use anyhow::{bail, Context, Result};
 use serde_json::json;
 use std::{
-    io::{Read, Write},
+    io::Write,
     path::{Path, PathBuf},
     process::Command,
 };
-
-fn sha256_file(path: &Path) -> Result<(u64, String)> {
-    use sha2::{Digest, Sha256};
-    let mut f =
-        std::fs::File::open(path).with_context(|| format!("Cannot read {}", path.display()))?;
-    let mut h = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
-    let mut n_total = 0u64;
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-        n_total += n as u64;
-    }
-    Ok((
-        n_total,
-        h.finalize().iter().map(|b| format!("{b:02x}")).collect(),
-    ))
-}
 
 /// Where the kit keeps the memory tool, relative to dflive's own directory
 /// (`dflive/<arch>/dflive` and `avml/<arch>/avml` on KIT-LNX,
@@ -96,7 +76,7 @@ pub fn run(out: &str, tool: Option<&str>, compress: bool) -> Result<u8> {
         bail!("{} exists already", record_path.display());
     }
     let tool = find_tool(tool)?;
-    let tool_hash = sha256_file(&tool).ok().map(|(_, h)| h);
+    let tool_hash = sha256_file(&tool).map(|(_, h)| h);
     // AVML (0.20): `acquire [--compress] FILE`; WinPmem mini: `FILE`
     let mut args: Vec<String> = Vec::new();
     if !cfg!(windows) {
@@ -113,12 +93,20 @@ pub fn run(out: &str, tool: Option<&str>, compress: bool) -> Result<u8> {
         tool.display(),
         args.join(" ")
     );
-    let output = Command::new(&tool)
-        .args(&args)
-        .output()
-        .with_context(|| format!("Cannot run {}", tool.display()))?;
+    let command = format!("{} {}", tool.display(), args.join(" "));
+    let output = match Command::new(&tool).args(&args).output() {
+        Ok(o) => o,
+        Err(e) => {
+            footprint::child(&command, &start, None, Some(&e.to_string()));
+            return Err(e).with_context(|| format!("Cannot run {}", tool.display()));
+        }
+    };
+    footprint::child(&command, &start, output.status.code(), None);
     let end = crate::now_rfc3339();
-    let dump = sha256_file(out_path).ok();
+    let dump = sha256_file(out_path);
+    if let Some((bytes, sha)) = &dump {
+        footprint::wrote(out, *bytes, sha);
+    }
     let tail = |b: &[u8]| {
         let s = String::from_utf8_lossy(b);
         let lines: Vec<&str> = s.lines().collect();
@@ -147,12 +135,25 @@ pub fn run(out: &str, tool: Option<&str>, compress: bool) -> Result<u8> {
             "AVML reads /proc/kcore, /dev/crash or /dev/mem; no kernel module is loaded"
         },
     });
+    let record_bytes = serde_json::to_string_pretty(&record)?;
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&record_path)?;
-    f.write_all(serde_json::to_string_pretty(&record)?.as_bytes())?;
+    f.write_all(record_bytes.as_bytes())?;
     f.sync_all()?;
+    {
+        use sha2::Digest;
+        let digest: String = sha2::Sha256::digest(record_bytes.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        footprint::wrote(
+            &record_path.display().to_string(),
+            record_bytes.len() as u64,
+            &digest,
+        );
+    }
     match (&dump, output.status.success()) {
         (Some((bytes, sha)), true) => {
             eprintln!(

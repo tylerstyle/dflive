@@ -1,7 +1,10 @@
-//! dflive: companion for running suspect systems. This first part is `send`:
-//! stream a disk, a volume, a file or stdin to `dfnet stream` on dfnix over
-//! an authenticated, encrypted dfstream/1 connection.
+//! dflive: companion for running suspect systems. In the checklists' order:
+//! `status` (scene record), `keys`, `mem`, `state`, and `send`, which streams a
+//! disk, a volume, a file or stdin to `dfnet stream` on dfnix over an
+//! authenticated, encrypted dfstream/1 connection. `--log` appends a footprint
+//! record of every run.
 
+mod footprint;
 mod keys;
 mod mem;
 mod source;
@@ -10,6 +13,7 @@ mod state;
 #[cfg(windows)]
 #[path = "state_windows.rs"]
 mod state;
+mod status;
 mod winfmt;
 
 use anyhow::{Context, Result};
@@ -34,6 +38,10 @@ pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
     about = "Companion for running systems: authenticated streams to dfnix"
 )]
 struct Cli {
+    /// Append a JSON record of this run to this file (e.g. on the kit's output
+    /// partition): dflive's own hash and kit, child commands, files written
+    #[arg(long, global = true)]
+    log: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -56,9 +64,6 @@ enum Command {
         /// disk, volume, memory or file (default: from the source)
         #[arg(long)]
         kind: Option<String>,
-        /// Append a JSON record of this run to this file (e.g. on the kit's output partition)
-        #[arg(long)]
-        log: Option<String>,
         /// Network timeout in seconds
         #[arg(long, default_value = "120")]
         timeout: u64,
@@ -66,6 +71,17 @@ enum Command {
         /// unreadable sectors by zeros (disks and volumes)
         #[arg(long)]
         stop_on_error: bool,
+    },
+    /// Scene record: the system clock against a reference time, OS, uptime,
+    /// users, disks and volumes, encryption at a glance, cloud sync clients
+    Status {
+        /// The reference time (radio clock, phone) as RFC 3339 with offset,
+        /// typed with the command, e.g. 2026-10-16T17:05:00+02:00
+        #[arg(long)]
+        reference_time: Option<String>,
+        /// Write the JSON here (a new file); default: stdout
+        #[arg(long, short = 'o')]
+        out: Option<String>,
     },
     /// Capture encryption state and key material (LUKS headers and dm-crypt
     /// keys, BitLocker protectors, FileVault/APFS state) while volumes are unlocked
@@ -298,7 +314,6 @@ struct SendArgs {
     code: Option<String>,
     name: Option<String>,
     kind: Option<String>,
-    log: Option<String>,
     timeout: u64,
     stop_on_error: bool,
 }
@@ -394,25 +409,14 @@ fn send(a: SendArgs) -> Result<u8> {
         outcome.status,
         outcome.bytes
     );
-    if let Some(log) = a.log {
-        let record = json!({
-            "tool": "dflive",
-            "version": VERSION,
-            "action": "send",
-            "started": started,
-            "finished": now_rfc3339(),
-            "receiver": a.to,
-            "session": ch.session_id,
-            "stream": start,
-            "end": end,
-            "outcome": outcome,
-        });
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log)?;
-        writeln!(f, "{record}")?;
-    }
+    footprint::result(json!({
+        "started": started,
+        "receiver": a.to,
+        "session": ch.session_id,
+        "stream": start,
+        "end": end,
+        "outcome": outcome,
+    }));
     Ok(match outcome.status.as_str() {
         "complete" => 0,
         "mismatch" => 5,
@@ -435,7 +439,37 @@ fn write_new(path: &str, data: &[u8]) -> Result<()> {
         .map(|b| format!("{b:02x}"))
         .collect();
     eprintln!("[✓] {path}: {} bytes, SHA-256 {digest}", data.len());
+    footprint::wrote(path, data.len() as u64, &digest);
     Ok(())
+}
+
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
+fn status_cmd(system_ms: i64, reference: Option<&str>, out: Option<String>) -> Result<u8> {
+    let doc = status::collect(system_ms, reference)?;
+    status::summary(&doc);
+    let bytes = serde_json::to_vec_pretty(&doc)?;
+    match out {
+        Some(path) => write_new(&path, &bytes)?,
+        None => std::io::stdout().write_all(&bytes)?,
+    }
+    Ok(0)
+}
+
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+fn status_cmd(_: i64, _: Option<&str>, _: Option<String>) -> Result<u8> {
+    anyhow::bail!("dflive status is not available on this OS")
+}
+
+impl Command {
+    fn name(&self) -> &'static str {
+        match self {
+            Command::Send { .. } => "send",
+            Command::Status { .. } => "status",
+            Command::Keys { .. } => "keys",
+            Command::Mem { .. } => "mem",
+            Command::State { .. } => "state",
+        }
+    }
 }
 
 fn keys_cmd(out: &str, recipients: &[String]) -> Result<u8> {
@@ -467,7 +501,15 @@ fn state_cmd(_out: Option<String>, _hash: bool) -> Result<u8> {
 }
 
 fn main() -> ExitCode {
+    // The moment the command was given: status compares it with the reference time
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let started_ms = now.as_millis() as i64;
+    let started = rfc3339(now.as_secs() as i64, now.subsec_millis());
     let cli = Cli::parse();
+    let action = cli.command.name();
+    let log = cli.log;
     let result = match cli.command {
         Command::Send {
             source,
@@ -475,7 +517,6 @@ fn main() -> ExitCode {
             code,
             name,
             kind,
-            log,
             timeout,
             stop_on_error,
         } => send(SendArgs {
@@ -484,10 +525,13 @@ fn main() -> ExitCode {
             code,
             name,
             kind,
-            log,
             timeout,
             stop_on_error,
         }),
+        Command::Status {
+            reference_time,
+            out,
+        } => status_cmd(started_ms, reference_time.as_deref(), out),
         Command::State { out, no_hash } => state_cmd(out, !no_hash),
         Command::Keys {
             out, recipients, ..
@@ -498,6 +542,12 @@ fn main() -> ExitCode {
             compress,
         } => mem::run(&out, tool.as_deref(), compress),
     };
+    if let Some(log) = log {
+        let outcome = result.as_ref().copied().map_err(|e| format!("{e:#}"));
+        if let Err(e) = footprint::append(&log, action, &started, &outcome) {
+            eprintln!("[!] Cannot append to the log {log}: {e:#}");
+        }
+    }
     match result {
         Ok(code) => ExitCode::from(code),
         Err(e) => {

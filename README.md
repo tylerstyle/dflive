@@ -6,14 +6,46 @@ disks.
 
 This repository holds:
 
-- **`dflive`**: the companion, with `keys`, `mem`, `state` and `send`.
+- **`dflive`**: the companion, with `status`, `keys`, `mem`, `state` and `send`.
 - **`dfstream`**: the dfstream/1 protocol, also used by `dfnet stream` on dfnix.
 
-Planned: `status` (scene record), macOS `state`, and `dfkit`, which
-writes and verifies the kit sticks on dfnix.
+Planned: macOS `state`, and `dfkit`, which writes and verifies the kit sticks
+on dfnix.
 
 The checklists in dfnix (`docs/playbooks/live-*.md`) give the order at a scene:
-keys first, then memory, then volatile state, then live volumes.
+the scene record, keys, memory, volatile state, then live volumes.
+
+## The footprint log (`--log`)
+
+Every subcommand takes `--log FILE` and appends one JSON line per run, on the
+kit's output partition or the target drive. The line holds:
+
+- dflive's own SHA-256;
+- the kit partition dflive ran from, and whether the kit's
+  `KIT-MANIFEST.sha256` lists dflive with exactly that hash;
+- every child command with its exit status;
+- every file written, with its SHA-256;
+- the result.
+
+The report can then account for everything dflive did on the suspect system.
+
+```text
+dflive status --reference-time 2026-10-16T17:05:00+02:00 -o /mnt/out/case/01-status.json --log /mnt/out/case/dflive.jsonl
+```
+
+## `dflive status`
+
+The scene record: quick and read-only. It holds:
+
+- the system clock against a reference time typed with the command (radio
+  clock, phone), with the offset;
+- OS and build, time zone, boot time;
+- who is logged in, and whether dflive runs elevated;
+- disks and volumes (model, serial, size, mounts, network drives);
+- encryption at a glance (LUKS headers and open dm-crypt mappings;
+  `manage-bde -status`; `fdesetup status`);
+- running cloud sync clients and their folders, which are found by looking up
+  known names in each profile, not by listing user directories.
 
 ## `dflive keys`
 
