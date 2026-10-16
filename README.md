@@ -9,7 +9,7 @@ This repository holds:
 - **`dflive`**: the companion, with `keys`, `mem`, `state` and `send`.
 - **`dfstream`**: the dfstream/1 protocol, also used by `dfnet stream` on dfnix.
 
-Planned: `status` (scene record), Windows and macOS `state`, and `dfkit`, which
+Planned: `status` (scene record), macOS `state`, and `dfkit`, which
 writes and verifies the kit sticks on dfnix.
 
 The checklists in dfnix (`docs/playbooks/live-*.md`) give the order at a scene:
@@ -49,19 +49,27 @@ Macs have no reliable tool; dflive refuses there, as the checklist says.
 dflive mem -o /mnt/target/physmem.lime --compress
 ```
 
-## `dflive state` (Linux)
+## `dflive state`
 
-Records the volatile state with dflive's own code from `/proc`, sysfs, utmp and
-getifaddrs, not through the suspect's possibly tampered `ps`, `netstat` or `who`:
+Records the volatile state with dflive's own code, not through the suspect's
+possibly tampered `ps`, `netstat`, `who`, `tasklist` or `query user`:
 
-- processes with command lines, start times, owners and the SHA-256 of their
-  executables (opened `O_NOATIME`);
-- TCP and UDP sockets with their owning processes;
-- interfaces and addresses, routes, the ARP cache and DNS configuration;
-- mounts, swap, loaded modules and logged-in users.
+- **Linux** (from `/proc`, sysfs, utmp and getifaddrs): processes with command
+  lines, start times, owners and the SHA-256 of their executables (opened
+  `O_NOATIME`); TCP and UDP sockets with their owning processes; interfaces and
+  addresses, routes, the ARP cache and DNS configuration; mounts, swap, loaded
+  modules and logged-in users.
+- **Windows** (through the Windows API): processes with command lines, start
+  times, owners (SID and account) and image SHA-256; TCP and UDP endpoints with
+  their owning processes; adapters with addresses, gateways and DNS servers;
+  routes and the neighbour cache; logon sessions (console and RDP, with client
+  name and address); running services and drivers with their processes; loaded
+  kernel images; OS version, time zone and boot time. The record also notes
+  whether NTFS updates last-access times, because hashing reads every image.
 
 ```text
 dflive state -o /mnt/out/case/04-state.json
+dflive.exe state -o E:\case\04-state.json
 ```
 
 ## `dflive send`
@@ -103,8 +111,16 @@ Exit codes: 0 complete, 4 failed (no connection, wrong code), 5 hashes differ,
 
 ```bash
 cargo build --release -p dflive
-nix build
+nix build                              # this system
+nix build .#dflive-static              # Linux x86_64, static (for the kit)
+nix build .#dflive-aarch64-static      # Linux aarch64, static
+nix build .#dflive-windows             # dflive.exe, system DLLs only
 ```
+
+Tests: `cargo test`; `nix build .#checks.x86_64-linux.live` (VM: LUKS1/LUKS2
+keys, state, AVML), `.#checks.x86_64-linux.wine` (dflive.exe state and keys
+under Wine); `nix-build tests/stream.nix` (two VMs with `dfnet stream`, needs
+`../dfnet` and `../dfcore`).
 
 ## License
 

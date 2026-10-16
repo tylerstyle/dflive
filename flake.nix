@@ -16,6 +16,19 @@
         packages = {
           default = dflive;
           dflive = dflive;
+        } // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          # The field kit's binaries
+          dflive-static = pkgs.pkgsStatic.callPackage ./package.nix { };
+          dflive-aarch64-static = pkgs.pkgsCross.aarch64-multiplatform-musl.pkgsStatic.callPackage ./package.nix { };
+          dflive-windows = pkgs.pkgsCross.mingwW64.callPackage ./package.nix { };
+        };
+
+        checks = pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          live = import ./tests/live.nix { inherit pkgs dflive; };
+          wine = import ./tests/wine.nix {
+            inherit pkgs;
+            dflive = self.packages.${system}.dflive-windows;
+          };
         };
 
         apps = {

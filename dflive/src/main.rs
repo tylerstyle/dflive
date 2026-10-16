@@ -7,6 +7,10 @@ mod mem;
 mod source;
 #[cfg(target_os = "linux")]
 mod state;
+#[cfg(windows)]
+#[path = "state_windows.rs"]
+mod state;
+mod winfmt;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -89,7 +93,7 @@ enum Command {
         #[arg(long)]
         compress: bool,
     },
-    /// Record the volatile state with dflive's own code (Linux so far): processes
+    /// Record the volatile state with dflive's own code (Linux, Windows): processes
     /// with executable hashes, sockets with their processes, interfaces, routes,
     /// ARP, users, mounts, modules
     State {
@@ -445,7 +449,7 @@ fn keys_cmd(out: &str, recipients: &[String]) -> Result<u8> {
     Ok(0)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn state_cmd(out: Option<String>, hash: bool) -> Result<u8> {
     let doc = serde_json::to_vec_pretty(&state::collect(hash))?;
     match out {
@@ -455,7 +459,7 @@ fn state_cmd(out: Option<String>, hash: bool) -> Result<u8> {
     Ok(0)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn state_cmd(_out: Option<String>, _hash: bool) -> Result<u8> {
     anyhow::bail!(
         "dflive state is not available on this OS yet; use the checklist's built-in commands"

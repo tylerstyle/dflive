@@ -43,3 +43,6 @@ jobs:
 
       - name: Build package (runs the test suite in the Nix sandbox)
         run: nix build -L .#default
+
+      - name: Windows build under Wine (state, keys)
+        run: nix build -L .#checks.x86_64-linux.wine
