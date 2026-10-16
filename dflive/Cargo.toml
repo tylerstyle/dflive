@@ -1,0 +1,19 @@
+[package]
+name = "dflive"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+age = "0.11"
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+dfstream = { version = "0.1.0", path = "../dfstream" }
+libc = "0.2.190"
+serde_json = "1.0.154"
+sha2 = "0.11"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_IO", "Win32_System_Ioctl", "Win32_Foundation"] }
