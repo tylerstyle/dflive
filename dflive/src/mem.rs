@@ -13,8 +13,9 @@ use std::{
 };
 
 /// Where the kit keeps the memory tool, relative to dflive's own directory
-/// (`dflive/<arch>/dflive` and `avml/<arch>/avml` on KIT-LNX,
-/// `dflive\dflive.exe` and `winpmem\` on KIT-WIN), then `PATH`.
+/// (`dflive/<arch>/dflive` and `avml/<arch>/avml` on KIT-LNX, `dflive.exe`
+/// and `winpmem\` at the root of KIT-WIN), then `PATH`. A path found on the
+/// kit is recorded without `..`.
 fn find_tool(explicit: Option<&str>) -> Result<PathBuf> {
     if let Some(t) = explicit {
         return Ok(PathBuf::from(t));
@@ -32,6 +33,7 @@ fn find_tool(explicit: Option<&str>) -> Result<PathBuf> {
         };
         vec![
             exe_dir.join(name),
+            exe_dir.join("winpmem").join(name),
             exe_dir.join("..").join("winpmem").join(name),
         ]
     } else {
@@ -52,7 +54,7 @@ fn find_tool(explicit: Option<&str>) -> Result<PathBuf> {
     };
     for c in &candidates {
         if c.is_file() {
-            return Ok(c.clone());
+            return Ok(lexical(c));
         }
     }
     let name = if cfg!(windows) {
@@ -61,6 +63,28 @@ fn find_tool(explicit: Option<&str>) -> Result<PathBuf> {
         "avml"
     };
     Ok(PathBuf::from(name))
+}
+
+/// `a/b/../c` → `a/c` without touching the filesystem (the kit has no
+/// symlinks; canonicalize would add `\\?\` on Windows)
+fn lexical(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                // the root's parent is the root
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => out.push(".."),
+            },
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 pub fn run(out: &str, tool: Option<&str>, compress: bool) -> Result<u8> {
@@ -170,5 +194,23 @@ pub fn run(out: &str, tool: Option<&str>, compress: bool) -> Result<u8> {
             );
             Ok(4)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lexical;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn lexical_drops_dot_dot() {
+        let l = |p: &str| lexical(Path::new(p));
+        assert_eq!(
+            l("/mnt/kit/dflive/x86_64/../../avml/x86_64/avml"),
+            PathBuf::from("/mnt/kit/avml/x86_64/avml")
+        );
+        assert_eq!(l("/mnt/./kit/../kit/avml"), PathBuf::from("/mnt/kit/avml"));
+        assert_eq!(l("/../avml"), PathBuf::from("/avml"));
+        assert_eq!(l("../a/../../b"), PathBuf::from("../../b"));
     }
 }
