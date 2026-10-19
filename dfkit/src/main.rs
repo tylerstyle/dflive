@@ -14,15 +14,19 @@
 //!   only for `--only win`) with `O_DIRECT` to verify their SHA-256 digests against `fieldkit.img`,
 //!   and records a `fieldkit_write` audit entry.
 //! - `dfkit verify DEVICE [IMAGE_DIR]`:
-//!   Reads `KIT-ID.json` on `KIT-OUT` first to determine stick layout, verifies the layout
-//!   against the GPT table, mounts written tool partitions read-only (`KIT-WIN` as exFAT, with
-//!   NTFS fallback for sticks written from older images; `hfsplus ro`; `ext4 ro,noload`), verifies
-//!   every tool file and symlink against `manifest.json` (skipping partitions 2–3 when layout is
-//!   `win`), separates allowlisted OS-added noise (`System Volume Information/**`, `.Spotlight-V100/**`,
-//!   `.fseventsd/**`, …) from changed/missing tool files and planted unexpected files (`[UNEXPECTED]`),
-//!   inspects `KIT-OUT` read-only and suggests `dfcollect files`, records `fieldkit_verify` in the
-//!   audit log, and exits `0` (all tool files intact and no unexpected files) or `5` (tool file
-//!   changed/missing or unexpected file present).
+//!   Reads `KIT-ID.json` on `KIT-OUT` first to determine stick layout and confirm the kit image;
+//!   compares `KIT-ID.json`'s `image_sha256` and `kit_version` against `manifest.json` before mounting
+//!   tool partitions, refusing verification (exit `2`) with a clear error and audit record if the stick
+//!   was written from a different field-kit image (or continuing with a warning and audit note if
+//!   `KIT-ID.json` is missing/unreadable); verifies layout against the GPT table; mounts written tool
+//!   partitions read-only (`KIT-WIN` as exFAT, with NTFS fallback for sticks written from older images;
+//!   `hfsplus ro`; `ext4 ro,noload`); verifies every tool file and symlink against `manifest.json`
+//!   (skipping partitions 2–3 when layout is `win`); separates allowlisted OS-added noise
+//!   (`System Volume Information/**`, `.Spotlight-V100/**`, `.fseventsd/**`, …) from changed/missing tool
+//!   files and planted unexpected files (`[UNEXPECTED]`); inspects `KIT-OUT` read-only and suggests
+//!   `dfcollect files`; records `fieldkit_verify` in the audit log; and exits `0` (all tool files intact
+//!   and no unexpected files), `2` (refusal: protected device or kit image mismatch, nothing checked),
+//!   `5` (tool file changed/missing or unexpected file present), or `1` (fatal error).
 
 mod gpt;
 mod manifest;
@@ -106,7 +110,13 @@ enum Commands {
         #[arg(long = "only", value_enum)]
         only: Option<KitLayout>,
     },
-    /// Verify a field-kit stick after deployment against manifest.json and report KIT-OUT contents
+    /// Verify a field-kit stick after deployment against manifest.json and report KIT-OUT contents.
+    ///
+    /// Exit codes:
+    ///   0: all tool files intact and no unexpected files
+    ///   2: refusal (e.g. kit image mismatch between stick and manifest; nothing checked)
+    ///   5: tool files changed/missing or unexpected files present
+    ///   1: fatal error
     Verify {
         /// Whole-disk device node of the field-kit stick (e.g. /dev/sdX)
         device: String,
@@ -1115,6 +1125,93 @@ fn mount_partition_ro(part_dev: &str, fstype: &str, tag: &str) -> Result<TempMou
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum KitIdCheck {
+    Match,
+    Unconfirmed {
+        reason: String,
+    },
+    Mismatch {
+        stick_version: String,
+        stick_image_sha256: String,
+        manifest_version: String,
+        manifest_image_sha256: String,
+        message: String,
+    },
+}
+
+fn sanitize_display_version(raw: &str) -> String {
+    let is_clean = raw.len() <= 32
+        && !raw.is_empty()
+        && raw.chars().all(|c| c.is_ascii() && !c.is_ascii_control());
+    if is_clean {
+        raw.to_string()
+    } else {
+        let truncated: String = raw.chars().take(32).collect();
+        format!("{truncated:?}")
+    }
+}
+
+fn check_kit_id(
+    kit_id: Option<&Value>,
+    manifest: &FieldkitManifest,
+    device: &str,
+    image_dir: &Path,
+) -> KitIdCheck {
+    let val = match kit_id {
+        Some(v) => v,
+        None => {
+            return KitIdCheck::Unconfirmed {
+                reason: "KIT-ID.json is missing or unreadable on KIT-OUT".into(),
+            };
+        }
+    };
+
+    let stick_sha = match val.get("image_sha256").and_then(|v| v.as_str()) {
+        Some(s) if s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) => s,
+        Some(_) => {
+            return KitIdCheck::Unconfirmed {
+                reason: "KIT-ID.json image_sha256 is not a 64-character hex digest".into(),
+            };
+        }
+        None => {
+            return KitIdCheck::Unconfirmed {
+                reason: "KIT-ID.json does not contain image_sha256".into(),
+            };
+        }
+    };
+
+    let raw_stick_version = val
+        .get("kit_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let display_version = sanitize_display_version(raw_stick_version);
+
+    if stick_sha.eq_ignore_ascii_case(&manifest.image.sha256) {
+        KitIdCheck::Match
+    } else {
+        let stick_sha12 = &stick_sha[..12];
+        let manifest_sha12 = &manifest.image.sha256[..manifest.image.sha256.len().min(12)];
+        let img_disp = if image_dir.is_file() {
+            image_dir.parent().unwrap_or(image_dir)
+        } else {
+            image_dir
+        };
+        let msg = format!(
+            "This stick was written from field kit {display_version} (image sha256 {stick_sha12}…), but {} is field kit {} (image sha256 {manifest_sha12}…). Verify it against the image that wrote it (dfkit verify {device} IMAGE_DIR) or rewrite the stick with dfkit write.",
+            img_disp.display(),
+            manifest.version
+        );
+        KitIdCheck::Mismatch {
+            stick_version: raw_stick_version.to_string(),
+            stick_image_sha256: stick_sha.to_string(),
+            manifest_version: manifest.version.clone(),
+            manifest_image_sha256: manifest.image.sha256.clone(),
+            message: msg,
+        }
+    }
+}
+
 fn cmd_verify(device: &str, image_dir_opt: Option<PathBuf>) -> Result<u8> {
     let image_dir = resolve_default_image_dir(image_dir_opt)?;
     let manifest_path = if image_dir.is_file() && image_dir.ends_with("manifest.json") {
@@ -1174,6 +1271,51 @@ fn cmd_verify(device: &str, image_dir_opt: Option<PathBuf>) -> Result<u8> {
         .and_then(|v| v.get("layout"))
         .and_then(|v| v.as_str())
         .unwrap_or("full");
+
+    let kit_check = check_kit_id(kit_id_val.as_ref(), &manifest, &canon, &image_dir);
+    match &kit_check {
+        KitIdCheck::Mismatch {
+            stick_version,
+            stick_image_sha256,
+            manifest_version,
+            manifest_image_sha256,
+            message,
+        } => {
+            eprintln!("{message}");
+            let mut details = Map::new();
+            details.insert(
+                "manifest_path".into(),
+                manifest_path.to_string_lossy().into_owned().into(),
+            );
+            details.insert("manifest_version".into(), manifest_version.clone().into());
+            details.insert(
+                "manifest_image_sha256".into(),
+                manifest_image_sha256.clone().into(),
+            );
+            details.insert("stick_version".into(), stick_version.clone().into());
+            details.insert(
+                "stick_image_sha256".into(),
+                stick_image_sha256.clone().into(),
+            );
+            details.insert("kit_version".into(), manifest_version.clone().into());
+            details.insert("image_sha256".into(), manifest_image_sha256.clone().into());
+            details.insert("kit_id".into(), json!(kit_id_val));
+            details.insert("layout".into(), layout.into());
+            details.insert("refusal_reason".into(), message.clone().into());
+            append_audit(
+                "fieldkit_verify",
+                Some(identity),
+                details,
+                Outcome::Refused,
+                Some(message.clone()),
+            );
+            return Ok(2);
+        }
+        KitIdCheck::Unconfirmed { reason } => {
+            eprintln!("[!] Warning: Cannot confirm field kit image on {canon}: {reason}");
+        }
+        KitIdCheck::Match => {}
+    }
 
     // Validate layout against GPT: "win" while entries 2/3 exist or full while missing is an error
     validate_layout_gpt(&gpt, layout)?;
@@ -1300,6 +1442,7 @@ fn cmd_verify(device: &str, image_dir_opt: Option<PathBuf>) -> Result<u8> {
         manifest_path.to_string_lossy().into_owned().into(),
     );
     details.insert("kit_version".into(), manifest.version.into());
+    details.insert("manifest_image_sha256".into(), manifest.image.sha256.into());
     details.insert("layout".into(), layout.into());
     details.insert("intact_files".into(), total_intact_files.into());
     details.insert("intact_symlinks".into(), total_intact_symlinks.into());
@@ -1308,6 +1451,12 @@ fn cmd_verify(device: &str, image_dir_opt: Option<PathBuf>) -> Result<u8> {
     details.insert("unexpected".into(), serde_json::to_value(&all_unexpected)?);
     details.insert("os_added".into(), serde_json::to_value(&all_os_added)?);
     details.insert("kit_id".into(), json!(kit_id_val));
+    if let KitIdCheck::Unconfirmed { reason } = &kit_check {
+        details.insert("kit_image_confirmed".into(), false.into());
+        details.insert("kit_image_warning".into(), reason.clone().into());
+    } else {
+        details.insert("kit_image_confirmed".into(), true.into());
+    }
     details.insert("kit_out_files".into(), Value::Array(kit_out_files));
     details.insert("tools_intact".into(), tools_intact.into());
 
@@ -1483,6 +1632,235 @@ mod tests {
         match cli_only_win.command {
             Commands::Write { only, .. } => assert_eq!(only, Some(KitLayout::Win)),
             _ => panic!("expected Write"),
+        }
+    }
+
+    #[test]
+    fn check_kit_id_matches_when_hash_is_identical() {
+        let manifest = FieldkitManifest {
+            schema: "dfnix.fieldkit.manifest/v0".into(),
+            version: "0.2.0".into(),
+            gpt_disk_guid: "44464E49-5800-4B49-5400-000000000000".into(),
+            image: crate::manifest::ManifestImage {
+                file: "fieldkit.img".into(),
+                size: 1024,
+                sha256: "9c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d".into(),
+            },
+            partitions: vec![],
+        };
+        let kit_id = json!({
+            "kit_version": "0.2.0",
+            "image_sha256": "9c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d",
+            "layout": "full"
+        });
+        let res = check_kit_id(
+            Some(&kit_id),
+            &manifest,
+            "/dev/sdb",
+            Path::new("/etc/dfnix/fieldkit"),
+        );
+        assert_eq!(res, KitIdCheck::Match);
+    }
+
+    #[test]
+    fn check_kit_id_mismatch_produces_refusal_message_with_short_hashes_and_paths() {
+        let manifest = FieldkitManifest {
+            schema: "dfnix.fieldkit.manifest/v0".into(),
+            version: "0.2.0".into(),
+            gpt_disk_guid: "44464E49-5800-4B49-5400-000000000000".into(),
+            image: crate::manifest::ManifestImage {
+                file: "fieldkit.img".into(),
+                size: 1024,
+                sha256: "9c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d".into(),
+            },
+            partitions: vec![],
+        };
+        let kit_id = json!({
+            "kit_version": "0.1.0",
+            "image_sha256": "3f2a1b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a",
+            "layout": "full"
+        });
+        let res = check_kit_id(
+            Some(&kit_id),
+            &manifest,
+            "/dev/sdc",
+            Path::new("/etc/dfnix/fieldkit"),
+        );
+        match res {
+            KitIdCheck::Mismatch {
+                stick_version,
+                stick_image_sha256,
+                manifest_version,
+                manifest_image_sha256,
+                message,
+            } => {
+                assert_eq!(stick_version, "0.1.0");
+                assert_eq!(manifest_version, "0.2.0");
+                assert_eq!(
+                    stick_image_sha256,
+                    "3f2a1b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a"
+                );
+                assert_eq!(
+                    manifest_image_sha256,
+                    "9c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d"
+                );
+                assert!(
+                    message.contains("field kit 0.1.0 (image sha256 3f2a1b4c5d6e…)"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains(
+                        "/etc/dfnix/fieldkit is field kit 0.2.0 (image sha256 9c1d2e3f4a5b…)"
+                    ),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("dfkit verify /dev/sdc IMAGE_DIR"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("rewrite the stick with dfkit write"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected Mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_kit_id_unconfirmed_on_missing_or_corrupt_id() {
+        let manifest = FieldkitManifest {
+            schema: "dfnix.fieldkit.manifest/v0".into(),
+            version: "0.2.0".into(),
+            gpt_disk_guid: "44464E49-5800-4B49-5400-000000000000".into(),
+            image: crate::manifest::ManifestImage {
+                file: "fieldkit.img".into(),
+                size: 1024,
+                sha256: "9c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d".into(),
+            },
+            partitions: vec![],
+        };
+        // None -> Unconfirmed
+        let res = check_kit_id(
+            None,
+            &manifest,
+            "/dev/sdb",
+            Path::new("/etc/dfnix/fieldkit"),
+        );
+        assert!(matches!(res, KitIdCheck::Unconfirmed { .. }));
+
+        // Missing image_sha256 -> Unconfirmed
+        let corrupt = json!({ "kit_version": "0.2.0" });
+        let res2 = check_kit_id(
+            Some(&corrupt),
+            &manifest,
+            "/dev/sdb",
+            Path::new("/etc/dfnix/fieldkit"),
+        );
+        assert!(matches!(res2, KitIdCheck::Unconfirmed { .. }));
+    }
+
+    #[test]
+    fn check_kit_id_unconfirmed_on_non_hex_or_multibyte_sha256() {
+        let manifest = FieldkitManifest {
+            schema: "dfnix.fieldkit.manifest/v0".into(),
+            version: "0.2.0".into(),
+            gpt_disk_guid: "44464E49-5800-4B49-5400-000000000000".into(),
+            image: crate::manifest::ManifestImage {
+                file: "fieldkit.img".into(),
+                size: 1024,
+                sha256: "9c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d".into(),
+            },
+            partitions: vec![],
+        };
+
+        // Multi-byte UTF-8 string that would panic if sliced on byte boundaries
+        let multibyte = json!({
+            "kit_version": "0.1.0",
+            "image_sha256": "ääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääääää",
+            "layout": "full"
+        });
+        let res1 = check_kit_id(
+            Some(&multibyte),
+            &manifest,
+            "/dev/sdb",
+            Path::new("/etc/dfnix/fieldkit"),
+        );
+        assert!(matches!(res1, KitIdCheck::Unconfirmed { .. }));
+
+        // Non-hex string
+        let non_hex = json!({
+            "kit_version": "0.1.0",
+            "image_sha256": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            "layout": "full"
+        });
+        let res2 = check_kit_id(
+            Some(&non_hex),
+            &manifest,
+            "/dev/sdb",
+            Path::new("/etc/dfnix/fieldkit"),
+        );
+        assert!(matches!(res2, KitIdCheck::Unconfirmed { .. }));
+
+        // Short hex string
+        let short = json!({
+            "kit_version": "0.1.0",
+            "image_sha256": "9c1d2e3f",
+            "layout": "full"
+        });
+        let res3 = check_kit_id(
+            Some(&short),
+            &manifest,
+            "/dev/sdb",
+            Path::new("/etc/dfnix/fieldkit"),
+        );
+        assert!(matches!(res3, KitIdCheck::Unconfirmed { .. }));
+    }
+
+    #[test]
+    fn check_kit_id_sanitizes_terminal_escapes_and_long_strings_in_kit_version() {
+        let manifest = FieldkitManifest {
+            schema: "dfnix.fieldkit.manifest/v0".into(),
+            version: "0.2.0".into(),
+            gpt_disk_guid: "44464E49-5800-4B49-5400-000000000000".into(),
+            image: crate::manifest::ManifestImage {
+                file: "fieldkit.img".into(),
+                size: 1024,
+                sha256: "9c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d".into(),
+            },
+            partitions: vec![],
+        };
+
+        let raw_crafted = "0.1.0\x1b[2J\r\nmalicious-rewrite";
+        let crafted = json!({
+            "kit_version": raw_crafted,
+            "image_sha256": "3f2a1b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a",
+            "layout": "full"
+        });
+        let res = check_kit_id(
+            Some(&crafted),
+            &manifest,
+            "/dev/sdb",
+            Path::new("/etc/dfnix/fieldkit"),
+        );
+        match res {
+            KitIdCheck::Mismatch {
+                stick_version,
+                message,
+                ..
+            } => {
+                // Raw version is preserved for audit log
+                assert_eq!(stick_version, raw_crafted);
+                // Display message is sanitized: no raw escape, carriage return, or newline
+                assert!(
+                    !message.contains('\x1b'),
+                    "message contains raw escape byte"
+                );
+                assert!(!message.contains('\n'), "message contains raw newline byte");
+                assert!(!message.contains('\r'), "message contains raw return byte");
+                assert!(message.contains(r#""0.1.0\u{1b}[2J\r\nmalicious-rewrite""#));
+            }
+            other => panic!("expected Mismatch, got {other:?}"),
         }
     }
 }

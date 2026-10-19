@@ -29,7 +29,7 @@ let
       fieldkit
     else
       pkgs.vmTools.runInLinuxVM (
-        pkgs.runCommand "dfkit-test-fieldkit-0.1.0"
+        pkgs.runCommand "dfkit-test-fieldkit-0.2.0"
           {
             memSize = 768;
             QEMU_OPTS = "-drive file=fieldkit.img,format=raw,if=virtio,cache=unsafe,werror=report";
@@ -61,7 +61,7 @@ let
               uac_b = b"#!/bin/sh\necho UAC\n"
               manifest = {
                 "schema": "dfnix.fieldkit.manifest/v0",
-                "version": "0.1.0",
+                "version": "0.2.0",
                 "gpt_disk_guid": "44464E49-5800-4B49-5400-000000000000",
                 "image": {
                   "file": "fieldkit.img",
@@ -363,6 +363,43 @@ pkgs.testers.runNixOSTest {
         assert rc != 0, f"expected verify failure on layout mismatch, got {rc}: {out_mismatch}"
         assert "Layout mismatch" in out_mismatch, out_mismatch
 
+    with subtest("detects kit image mismatch via KIT-ID.json (exit 2) and warns when KIT-ID.json is missing"):
+        # 1. Fresh write of full kit on /dev/vdb so stick is clean
+        machine.succeed(f"dfkit write {kit_dir} /dev/vdb --confirm vdb 2>&1")
+
+        # 2. Modify KIT-ID.json to simulate a stick written from a different kit image (e.g. 0.1.0)
+        machine.succeed("blockdev --setrw /dev/vdb /dev/vdb4 && mkdir -p /mnt/vdb4 && mount -t exfat /dev/vdb4 /mnt/vdb4")
+        orig_id_raw = machine.succeed("cat /mnt/vdb4/KIT-ID.json")
+        fake_id = json.loads(orig_id_raw)
+        fake_id["kit_version"] = "0.1.0"
+        fake_id["image_sha256"] = "3f2a1b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a"
+        machine.succeed(f"cat <<'EOF' > /mnt/vdb4/KIT-ID.json\n{json.dumps(fake_id, indent=2)}\nEOF")
+        machine.succeed("umount /mnt/vdb4")
+
+        # Verify must refuse with exit code 2 before mounting or checking tool partitions
+        rc, out_mismatch = machine.execute(f"dfkit verify /dev/vdb {kit_dir} 2>&1")
+        assert rc == 2, f"expected exit 2 on image mismatch, got {rc}: {out_mismatch}"
+        assert "field kit 0.1.0" in out_mismatch, out_mismatch
+        assert orig_meta["version"] in out_mismatch, out_mismatch
+        assert "rewrite the stick with dfkit write" in out_mismatch, out_mismatch
+        assert "3f2a1b4c5d6e" in out_mismatch, out_mismatch
+        assert orig_meta["image"]["sha256"][:12] in out_mismatch, out_mismatch
+        # Assert nothing else was mounted or checked
+        assert "Partition 1" not in out_mismatch, out_mismatch
+        assert "Partition 2" not in out_mismatch, out_mismatch
+        assert "Partition 3" not in out_mismatch, out_mismatch
+        assert "Field-kit verification" not in out_mismatch, out_mismatch
+
+        # 3. Test missing KIT-ID.json: emits a warning, but continues file-level verify and passes on intact stick
+        machine.succeed("blockdev --setrw /dev/vdb /dev/vdb4 && mount -t exfat /dev/vdb4 /mnt/vdb4")
+        machine.succeed("rm /mnt/vdb4/KIT-ID.json")
+        machine.succeed("umount /mnt/vdb4")
+
+        rc, out_missing_id = machine.execute(f"dfkit verify /dev/vdb {kit_dir} 2>&1")
+        assert rc == 0, f"expected exit 0 when KIT-ID.json missing on intact stick, got {rc}: {out_missing_id}"
+        assert "Cannot confirm field kit image" in out_missing_id, out_missing_id
+        assert "Field-kit verification PASSED" in out_missing_id, out_missing_id
+
     with subtest("audit log contains fieldkit_write and fieldkit_verify records with layout and wipe details"):
         lines = [json.loads(l) for l in machine.succeed("cat /run/dfnix/audit.jsonl").splitlines() if l.strip()]
         actions = [(r["action"], r["outcome"]) for r in lines]
@@ -370,6 +407,20 @@ pkgs.testers.runNixOSTest {
         assert ("fieldkit_write", "ok") in actions, actions
         assert ("fieldkit_verify", "ok") in actions, actions
         assert ("fieldkit_verify", "error") in actions, actions
+        assert ("fieldkit_verify", "refused") in actions, actions
+
+        # Check refusal details
+        verify_refused = [r for r in lines if r["action"] == "fieldkit_verify" and r["outcome"] == "refused"]
+        assert len(verify_refused) >= 1, verify_refused
+        vr = verify_refused[-1]
+        assert vr["details"]["stick_version"] == "0.1.0", vr
+        assert vr["details"]["manifest_version"] == orig_meta["version"], vr
+        assert vr["details"]["stick_image_sha256"] == "3f2a1b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a", vr
+        assert vr["details"]["manifest_image_sha256"] == orig_meta["image"]["sha256"], vr
+
+        # Check unconfirmed audit record
+        verify_unconfirmed = [r for r in lines if r["action"] == "fieldkit_verify" and r["details"].get("kit_image_confirmed") is False]
+        assert len(verify_unconfirmed) >= 1, verify_unconfirmed
 
         write_oks = [r for r in lines if r["action"] == "fieldkit_write" and r["outcome"] == "ok"]
         # Default write records kit_out_zeroed: False
