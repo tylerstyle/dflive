@@ -8,9 +8,9 @@ This repository holds:
 
 - **`dflive`**: the companion, with `status`, `keys`, `mem`, `state` and `send`.
 - **`dfstream`**: the dfstream/1 protocol, also used by `dfnet stream` on dfnix.
+- **`dfkit`**: writes and verifies multi-partition forensic field-kit USB sticks on dfnix, supporting full and `--only win` layouts and integrity verification.
 
-Planned: macOS `state`, and `dfkit`, which writes and verifies the kit sticks
-on dfnix.
+Planned: macOS `state`.
 
 The checklists in dfnix (`docs/playbooks/live-*.md`) give the order at a scene:
 the scene record, keys, memory, volatile state, then live volumes.

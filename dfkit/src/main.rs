@@ -1,23 +1,28 @@
 //! `dfkit`: write and verify multi-partition forensic field-kit USB sticks on `dfnix`.
 //!
-//! - `dfkit write IMAGE_DIR DEVICE... [--confirm NAME...]`:
+//! - `dfkit write IMAGE_DIR DEVICE... [--confirm NAME...] [--wipe] [--only win]`:
 //!   Verifies whole-disk safety guards (refuses system/protected disks, mounted disks,
 //!   4Kn disks, or write-blocked disks where `blockdev --getro != 0`), prompts for typed
 //!   kernel-name confirmation, re-verifies stick identity right before opening with
-//!   `O_EXCL`, writes `fieldkit.img`, moves the backup GPT header to the end of the stick
-//!   (`sgdisk -e`), grows partition 4 (`KIT-OUT`) to fill the stick, probes `KIT-OUT` with
-//!   `O_DIRECT` to catch counterfeit-capacity sticks, formats `KIT-OUT` as exFAT with the
-//!   fixed volume GUID, recreates `.metadata_never_index` and `.fseventsd/no_log`, writes
-//!   `KIT-ID.json`, reads back partitions 1–3 with `O_DIRECT` to verify their SHA-256
-//!   digests against `fieldkit.img`, and records a `fieldkit_write` audit entry.
+//!   `O_EXCL`, writes `fieldkit.img` (or only partition 1 plus a sparse GPT when `--only win`
+//!   is specified), moves the backup GPT header to the end of the stick (`sgdisk -e`), grows
+//!   partition 4 (`KIT-OUT`) to fill the stick, probes `KIT-OUT` with `O_DIRECT` to catch
+//!   counterfeit-capacity sticks, zeroes `KIT-OUT` completely only if opted in with `--wipe`,
+//!   formats `KIT-OUT` as exFAT with the fixed volume GUID, recreates
+//!   `.metadata_never_index` and `.fseventsd/no_log`, writes `KIT-ID.json` (recording layout and
+//!   wipe status), reads back written tool partitions (partitions 1–3 for full layout, partition 1
+//!   only for `--only win`) with `O_DIRECT` to verify their SHA-256 digests against `fieldkit.img`,
+//!   and records a `fieldkit_write` audit entry.
 //! - `dfkit verify DEVICE [IMAGE_DIR]`:
-//!   Mounts partitions 1–3 read-only (`ntfs3`/`ntfs-3g ro`, `hfsplus ro`, `ext4 ro,noload`),
-//!   verifies every tool file and symlink against `manifest.json`, separates allowlisted
-//!   OS-added noise (`System Volume Information/**`, `.Spotlight-V100/**`, `.fseventsd/**`, …)
-//!   from changed/missing tool files and planted unexpected files (`[UNEXPECTED]`), inspects
-//!   `KIT-OUT` read-only and suggests `dfcollect files`, records `fieldkit_verify` in the
-//!   audit log, and exits `0` (all tool files intact and no unexpected files) or `5`
-//!   (tool file changed/missing or unexpected file present).
+//!   Reads `KIT-ID.json` on `KIT-OUT` first to determine stick layout, verifies the layout
+//!   against the GPT table, mounts written tool partitions read-only (`KIT-WIN` as exFAT, with
+//!   NTFS fallback for sticks written from older images; `hfsplus ro`; `ext4 ro,noload`), verifies
+//!   every tool file and symlink against `manifest.json` (skipping partitions 2–3 when layout is
+//!   `win`), separates allowlisted OS-added noise (`System Volume Information/**`, `.Spotlight-V100/**`,
+//!   `.fseventsd/**`, …) from changed/missing tool files and planted unexpected files (`[UNEXPECTED]`),
+//!   inspects `KIT-OUT` read-only and suggests `dfcollect files`, records `fieldkit_verify` in the
+//!   audit log, and exits `0` (all tool files intact and no unexpected files) or `5` (tool file
+//!   changed/missing or unexpected file present).
 
 mod gpt;
 mod manifest;
@@ -29,7 +34,9 @@ use dfcore::{
     lsblk::{DeviceIdentity, FlatDevice},
     Refusal,
 };
-use gpt::{partition_dev_path, read_gpt, validate_fieldkit_gpt, GptTable, SECTOR_SIZE};
+use gpt::{
+    partition_dev_path, read_gpt, validate_fieldkit_gpt, validate_layout_gpt, GptTable, SECTOR_SIZE,
+};
 use manifest::{
     compare_partition, scan_mounted_tree, sha256_file, ChangedEntry, FieldkitManifest,
     MissingEntry, ObservedEntry, OsAddedEntry, UnexpectedEntry,
@@ -52,6 +59,20 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const KIT_OUT_EXFAT_GUID: &str = "44464e49-5800-4b49-5400-000000000004";
 const DIRECT_ALIGN: usize = 4096;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KitLayout {
+    Win,
+}
+
+impl KitLayout {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            KitLayout::Win => "win",
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "dfkit",
@@ -65,7 +86,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Write the field-kit image to one or more unblocked USB sticks, grow KIT-OUT, and verify partitions 1–3
+    /// Write the field-kit image to one or more unblocked USB sticks, grow KIT-OUT, and verify partitions
     Write {
         /// Path to the `nix build .#fieldkit` output directory (containing fieldkit.img and manifest.json)
         image_dir: PathBuf,
@@ -75,9 +96,15 @@ enum Commands {
         /// Confirm writing by kernel device name (e.g. --confirm sdb); repeatable or comma-separated
         #[arg(long = "confirm", value_delimiter = ',')]
         confirm: Vec<String>,
-        /// Skip zeroing KIT-OUT before mkfs.exfat (only safe on brand-new sticks; records kit_out_zeroed=false)
-        #[arg(long = "no-wipe")]
+        /// Zero KIT-OUT completely before mkfs.exfat (recommended when reusing a drive from another case)
+        #[arg(long = "wipe")]
+        wipe: bool,
+        /// Deprecated no-op (no zeroing is now default)
+        #[arg(long = "no-wipe", hide = true, conflicts_with = "wipe")]
         no_wipe: bool,
+        /// Write only the specified OS kit partition ('win' writes KIT-WIN; unallocated gap to KIT-OUT is left untouched)
+        #[arg(long = "only", value_enum)]
+        only: Option<KitLayout>,
     },
     /// Verify a field-kit stick after deployment against manifest.json and report KIT-OUT contents
     Verify {
@@ -620,17 +647,27 @@ fn write_one_stick(
     gpt: &GptTable,
     expected_part_hashes: &[(u32, String, u64, u64, String)],
     wipe: bool,
+    only: Option<KitLayout>,
 ) -> Result<(Vec<PartitionRangeHash>, u64)> {
     let dev = &stick.dev_path;
     reverify_stick_before_open(stick)?;
 
+    let bytes_to_copy = match only {
+        Some(KitLayout::Win) => {
+            let p1 = gpt
+                .partition(1)
+                .context("GPT missing partition 1 (KIT-WIN)")?;
+            (p1.last_lba + 1) * SECTOR_SIZE
+        }
+        None => manifest.image.size,
+    };
+
     eprintln!(
-        "[*] Writing {} ({} bytes) -> {dev}...",
-        img_path.display(),
-        manifest.image.size
+        "[*] Writing {} ({bytes_to_copy} bytes) -> {dev}...",
+        img_path.display()
     );
 
-    // 1. Copy fieldkit.img to the whole disk (opened O_EXCL) and sync
+    // 1. Copy fieldkit.img (full image or MBR+GPT+KIT-WIN) to the whole disk (opened O_EXCL) and sync
     {
         let mut src = File::open(img_path)?;
         let mut dst = OpenOptions::new()
@@ -640,8 +677,9 @@ fn write_one_stick(
             .with_context(|| format!("Cannot open {dev} exclusively (O_EXCL) for writing"))?;
         let mut buf = vec![0u8; 4 << 20];
         let mut written = 0u64;
-        loop {
-            let n = src.read(&mut buf)?;
+        while written < bytes_to_copy {
+            let to_read = ((bytes_to_copy - written) as usize).min(buf.len());
+            let n = src.read(&mut buf[..to_read])?;
             if n == 0 {
                 break;
             }
@@ -649,9 +687,8 @@ fn write_one_stick(
             written += n as u64;
         }
         ensure!(
-            written == manifest.image.size,
-            "Wrote {written} bytes to {dev}, expected {}",
-            manifest.image.size
+            written == bytes_to_copy,
+            "Wrote {written} bytes to {dev}, expected {bytes_to_copy}"
         );
         dst.sync_all()
             .with_context(|| format!("Failed to sync {dev}"))?;
@@ -670,27 +707,58 @@ fn write_one_stick(
     let name_p4_arg = format!("4:{}", p4.name);
     let guid_p4_arg = format!("4:{}", p4.part_guid);
 
-    eprintln!(
-        "[*] Moving GPT backup header to end of {dev} and growing partition 4 ({}) from LBA {}...",
-        p4.name, p4.first_lba
-    );
-    run_cmd("sgdisk", &["-e", dev])?;
-    run_cmd(
-        "sgdisk",
-        &[
-            "-d",
-            "4",
-            "-n",
-            &new_p4_arg,
-            "-t",
-            &type_p4_arg,
-            "-c",
-            &name_p4_arg,
-            "-u",
-            &guid_p4_arg,
-            dev,
-        ],
-    )?;
+    match only {
+        Some(KitLayout::Win) => {
+            eprintln!(
+                "[*] Moving GPT backup header to end of {dev}, pruning partitions 2-3, and growing partition 4 ({}) from LBA {}...",
+                p4.name, p4.first_lba
+            );
+            run_cmd("sgdisk", &["-e", dev])?;
+            run_cmd(
+                "sgdisk",
+                &[
+                    "-d",
+                    "2",
+                    "-d",
+                    "3",
+                    "-d",
+                    "4",
+                    "-n",
+                    &new_p4_arg,
+                    "-t",
+                    &type_p4_arg,
+                    "-c",
+                    &name_p4_arg,
+                    "-u",
+                    &guid_p4_arg,
+                    dev,
+                ],
+            )?;
+        }
+        None => {
+            eprintln!(
+                "[*] Moving GPT backup header to end of {dev} and growing partition 4 ({}) from LBA {}...",
+                p4.name, p4.first_lba
+            );
+            run_cmd("sgdisk", &["-e", dev])?;
+            run_cmd(
+                "sgdisk",
+                &[
+                    "-d",
+                    "4",
+                    "-n",
+                    &new_p4_arg,
+                    "-t",
+                    &type_p4_arg,
+                    "-c",
+                    &name_p4_arg,
+                    "-u",
+                    &guid_p4_arg,
+                    dev,
+                ],
+            )?;
+        }
+    }
 
     // Inform kernel of updated partition table and wait for udev
     if run_cmd("partx", &["-u", dev]).is_err() {
@@ -719,10 +787,14 @@ fn write_one_stick(
 
     // On dfnix, udev write-blocking rules may mark newly created partition nodes
     // read-only on add uevents; ensure disk + part4 are rw for probing/mkfs.exfat,
-    // and lock partitions 1-3 read-only.
+    // and lock tool partitions read-only.
     run_cmd("blockdev", &["--setrw", dev])?;
     run_cmd("blockdev", &["--setrw", &part4_dev])?;
-    for pdev in [&part1_dev, &part2_dev, &part3_dev] {
+    let tool_pdevs = match only {
+        Some(KitLayout::Win) => vec![part1_dev],
+        None => vec![part1_dev, part2_dev, part3_dev],
+    };
+    for pdev in &tool_pdevs {
         if Path::new(pdev).exists() {
             let _ = run_cmd("blockdev", &["--setro", pdev]);
         }
@@ -739,8 +811,7 @@ fn write_one_stick(
         );
     }
 
-    // 4. Zero KIT-OUT completely before mkfs.exfat so residual bytes from any previous
-    //    case cannot remain in unallocated exFAT clusters (unless opted out with --no-wipe).
+    // 4. Zero KIT-OUT completely before mkfs.exfat if opted in with --wipe
     if wipe {
         let mib = kit_out_bytes >> 20;
         let est_low_s = mib / 150;
@@ -756,7 +827,7 @@ fn write_one_stick(
         run_cmd("blockdev", &["--setrw", &part4_dev])?;
     } else {
         eprintln!(
-            "[!] --no-wipe: skipping KIT-OUT zeroing on {part4_dev} (only safe on brand-new sticks; recording kit_out_zeroed=false)."
+            "[*] KIT-OUT not zeroed on {part4_dev} (use --wipe for a drive reused from another case)."
         );
     }
 
@@ -788,10 +859,15 @@ fn write_one_stick(
         fs::create_dir_all(mnt.path().join(".fseventsd"))?;
         fs::write(mnt.path().join(".fseventsd/no_log"), b"")?;
 
+        let layout_str = match only {
+            Some(KitLayout::Win) => "win",
+            None => "full",
+        };
         let kit_id = json!({
             "schema": "dfnix.fieldkit.id/v0",
             "kit_version": manifest.version,
             "image_sha256": manifest.image.sha256,
+            "layout": layout_str,
             "serial": stick.identity.serial,
             "model": stick.identity.model,
             "device": stick.identity,
@@ -811,7 +887,7 @@ fn write_one_stick(
         mnt.unmount()?;
     }
 
-    // 6. Flush caches and read partitions 1-3 back from the stick with O_DIRECT
+    // 6. Flush caches and read tool partitions back from the stick with O_DIRECT
     run_cmd("blockdev", &["--flushbufs", dev])?;
     let mut part_results = Vec::new();
     for (num, label, offset, size, expected_sha) in expected_part_hashes {
@@ -846,7 +922,13 @@ fn write_one_stick(
     Ok((part_results, kit_out_bytes))
 }
 
-fn cmd_write(image_dir: &Path, devices: &[String], confirm: &[String], wipe: bool) -> Result<u8> {
+fn cmd_write(
+    image_dir: &Path,
+    devices: &[String],
+    confirm: &[String],
+    wipe: bool,
+    only: Option<KitLayout>,
+) -> Result<u8> {
     let (resolved_dir, img_path, manifest_path) = resolve_image_dir(image_dir)?;
     let manifest = FieldkitManifest::load(&manifest_path)?;
 
@@ -856,6 +938,11 @@ fn cmd_write(image_dir: &Path, devices: &[String], confirm: &[String], wipe: boo
     // Validate ALL requested target sticks before hashing or writing the full image
     let flat = dfcore::lsblk::scan()?;
     let mut sticks = Vec::new();
+    let layout_str = match only {
+        Some(KitLayout::Win) => "win",
+        None => "full",
+    };
+
     for dev in devices {
         match validate_stick_for_write(&flat, dev, manifest.image.size, confirm) {
             Ok(s) => sticks.push(s),
@@ -875,6 +962,8 @@ fn cmd_write(image_dir: &Path, devices: &[String], confirm: &[String], wipe: boo
                 );
                 details.insert("kit_version".into(), manifest.version.clone().into());
                 details.insert("image_sha256".into(), manifest.image.sha256.clone().into());
+                details.insert("layout".into(), layout_str.into());
+                details.insert("kit_out_zeroed".into(), wipe.into());
                 let outcome = if dfcore::is_refusal(&e) {
                     Outcome::Refused
                 } else {
@@ -905,14 +994,18 @@ fn cmd_write(image_dir: &Path, devices: &[String], confirm: &[String], wipe: boo
         manifest.image.sha256
     );
 
-    // Pre-compute byte-range SHA-256 for partitions 1..=3 in fieldkit.img
+    // Pre-compute byte-range SHA-256 for partitions in fieldkit.img
     let mut expected_part_hashes = Vec::new();
-    for num in 1..=3u32 {
+    let part_nums: Vec<u32> = match only {
+        Some(KitLayout::Win) => vec![1],
+        None => vec![1, 2, 3],
+    };
+    for num in &part_nums {
         let p = gpt
-            .partition(num)
+            .partition(*num)
             .with_context(|| format!("Missing partition {num} in GPT"))?;
         let sha = sha256_range(&img_path, p.offset_bytes(), p.size_bytes(), false)?;
-        expected_part_hashes.push((num, p.name.clone(), p.offset_bytes(), p.size_bytes(), sha));
+        expected_part_hashes.push((*num, p.name.clone(), p.offset_bytes(), p.size_bytes(), sha));
     }
 
     for stick in &sticks {
@@ -924,6 +1017,7 @@ fn cmd_write(image_dir: &Path, devices: &[String], confirm: &[String], wipe: boo
         );
         details.insert("kit_version".into(), manifest.version.clone().into());
         details.insert("image_sha256".into(), manifest.image.sha256.clone().into());
+        details.insert("layout".into(), layout_str.into());
         details.insert("confirmed_as".into(), stick.kernel_name.clone().into());
         details.insert("disk_bytes".into(), stick.disk_bytes.into());
         details.insert("kit_out_zeroed".into(), wipe.into());
@@ -935,6 +1029,7 @@ fn cmd_write(image_dir: &Path, devices: &[String], confirm: &[String], wipe: boo
             &gpt,
             &expected_part_hashes,
             wipe,
+            only,
         ) {
             Ok((part_hashes, kit_out_bytes)) => {
                 details.insert(
@@ -949,8 +1044,12 @@ fn cmd_write(image_dir: &Path, devices: &[String], confirm: &[String], wipe: boo
                     Outcome::Ok,
                     None,
                 );
+                let verified_desc = match only {
+                    Some(KitLayout::Win) => "partition 1 (KIT-WIN) verified",
+                    None => "partitions 1–3 verified",
+                };
                 println!(
-                    "[✓] Field-kit stick {} (serial: {}, KIT-OUT: {} MiB) written and partitions 1–3 verified.",
+                    "[✓] Field-kit stick {} (serial: {}, layout: {layout_str}, KIT-OUT: {} MiB) written and {verified_desc}.",
                     stick.dev_path,
                     stick.identity.serial.as_deref().unwrap_or("none"),
                     kit_out_bytes >> 20
@@ -984,7 +1083,7 @@ fn mount_partition_ro(part_dev: &str, fstype: &str, tag: &str) -> Result<TempMou
 
     match fstype {
         "ntfs" => {
-            // Try kernel ntfs3 (ro), then ntfs-3g (ro), then mount -t ntfs -o ro
+            // Retain NTFS mount path for backwards compatibility with sticks written with older images
             if run_cmd("mount", &["-t", "ntfs3", "-o", "ro", part_dev, &mnt_str]).is_ok()
                 || run_cmd("ntfs-3g", &["-o", "ro", part_dev, &mnt_str]).is_ok()
                 || run_cmd("mount", &["-t", "ntfs", "-o", "ro", part_dev, &mnt_str]).is_ok()
@@ -1042,6 +1141,43 @@ fn cmd_verify(device: &str, image_dir_opt: Option<PathBuf>) -> Result<u8> {
             ..Default::default()
         });
 
+    let part4_dev = partition_dev_path(&canon, 4);
+    ensure!(
+        Path::new(&part4_dev).exists(),
+        "Partition device {part4_dev} (KIT-OUT) does not exist on {canon}"
+    );
+
+    // Read GPT table from the stick
+    let dev_file = File::open(&canon)
+        .with_context(|| format!("Cannot open {canon} to read partition table"))?;
+    let gpt = read_gpt(dev_file)?;
+
+    // Inspect Partition 4 (KIT-OUT) to read KIT-ID.json and determine layout
+    let mut kit_id_val: Option<Value> = None;
+    let mut kit_out_files: Vec<Value> = Vec::new();
+    let mut case_files_count = 0usize;
+    let observed4;
+    {
+        let mut mnt4 = mount_partition_ro(&part4_dev, "exfat", "KIT-OUT")?;
+        let kit_id_path = mnt4.path().join("KIT-ID.json");
+        if kit_id_path.is_file() {
+            if let Ok(bytes) = fs::read(&kit_id_path) {
+                kit_id_val = serde_json::from_slice(&bytes).ok();
+            }
+        }
+        observed4 = scan_mounted_tree(mnt4.path())?;
+        mnt4.unmount()?;
+    }
+
+    let layout = kit_id_val
+        .as_ref()
+        .and_then(|v| v.get("layout"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("full");
+
+    // Validate layout against GPT: "win" while entries 2/3 exist or full while missing is an error
+    validate_layout_gpt(&gpt, layout)?;
+
     let mut total_intact_files = 0usize;
     let mut total_intact_symlinks = 0usize;
     let mut all_changed: Vec<ChangedEntry> = Vec::new();
@@ -1050,8 +1186,18 @@ fn cmd_verify(device: &str, image_dir_opt: Option<PathBuf>) -> Result<u8> {
     let mut all_unexpected: Vec<UnexpectedEntry> = Vec::new();
     let mut tools_intact = true;
 
-    // 1. Verify tool partitions 1..=3 read-only
-    for num in 1..=3u32 {
+    // Verify tool partitions according to verified layout
+    let tool_part_nums: Vec<u32> = match layout {
+        "win" => {
+            println!(
+                "[*] Detected field-kit layout: win (verifying partition 1: KIT-WIN, skipping unwritten partitions 2-3)"
+            );
+            vec![1]
+        }
+        _ => vec![1, 2, 3],
+    };
+
+    for num in tool_part_nums {
         let exp = manifest
             .partition(num)
             .with_context(|| format!("Manifest is missing partition {num}"))?;
@@ -1110,59 +1256,43 @@ fn cmd_verify(device: &str, image_dir_opt: Option<PathBuf>) -> Result<u8> {
         all_os_added.extend(diff.os_added);
     }
 
-    // 2. Inspect Partition 4 (KIT-OUT) read-only and report captured case files
-    let part4_dev = partition_dev_path(&canon, 4);
-    let mut kit_id_val: Option<Value> = None;
-    let mut kit_out_files: Vec<Value> = Vec::new();
-    let mut case_files_count = 0usize;
-    if Path::new(&part4_dev).exists() {
-        let mut mnt4 = mount_partition_ro(&part4_dev, "exfat", "KIT-OUT")?;
-        let kit_id_path = mnt4.path().join("KIT-ID.json");
-        if kit_id_path.is_file() {
-            if let Ok(bytes) = fs::read(&kit_id_path) {
-                kit_id_val = serde_json::from_slice(&bytes).ok();
-            }
-        }
-        let observed4 = scan_mounted_tree(mnt4.path())?;
-        mnt4.unmount()?;
-
-        println!(
-            "[*] Partition 4 (KIT-OUT, exfat): {} entries",
-            observed4.len()
+    // Report Partition 4 (KIT-OUT) captured case files
+    println!(
+        "[*] Partition 4 (KIT-OUT, exfat): {} entries",
+        observed4.len()
+    );
+    for (path, entry) in &observed4 {
+        let is_marker = matches!(
+            path.as_str(),
+            ".metadata_never_index" | ".fseventsd/no_log" | "KIT-ID.json"
         );
-        for (path, entry) in &observed4 {
-            let is_marker = matches!(
-                path.as_str(),
-                ".metadata_never_index" | ".fseventsd/no_log" | "KIT-ID.json"
+        let (size, sha256) = match entry {
+            ObservedEntry::File { size, sha256 } => (Some(*size), Some(sha256.clone())),
+            ObservedEntry::Symlink { .. } | ObservedEntry::Other { .. } => (None, None),
+        };
+        if !is_marker {
+            case_files_count += 1;
+            println!(
+                "    [KIT-OUT] {path} ({} bytes, sha256: {})",
+                size.unwrap_or(0),
+                sha256.as_deref().unwrap_or("-")
             );
-            let (size, sha256) = match entry {
-                ObservedEntry::File { size, sha256 } => (Some(*size), Some(sha256.clone())),
-                ObservedEntry::Symlink { .. } | ObservedEntry::Other { .. } => (None, None),
-            };
-            if !is_marker {
-                case_files_count += 1;
-                println!(
-                    "    [KIT-OUT] {path} ({} bytes, sha256: {})",
-                    size.unwrap_or(0),
-                    sha256.as_deref().unwrap_or("-")
-                );
-            }
-            kit_out_files.push(json!({
-                "path": path,
-                "size": size,
-                "sha256": sha256,
-                "kit_marker": is_marker,
-            }));
         }
-        println!(
-            "[*] To ingest KIT-OUT artifacts ({} case file(s)) into the case, mount {part4_dev} read-only (`dfmount evidence {part4_dev}`) and run:\n    dfcollect files /media/evidence/{} -o <CASE_DIR>/kit-out --case-id <CASE> --examiner <EXAMINER>",
-            case_files_count,
-            Path::new(&part4_dev)
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "kit-out".into())
-        );
+        kit_out_files.push(json!({
+            "path": path,
+            "size": size,
+            "sha256": sha256,
+            "kit_marker": is_marker,
+        }));
     }
+    println!(
+        "[*] To ingest KIT-OUT artifacts ({} case file(s)) into the case, mount {part4_dev} read-only (`dfmount evidence {part4_dev}`) and run:\n    dfcollect files /media/evidence/{} -o <CASE_DIR>/kit-out --case-id <CASE> --examiner <EXAMINER>",
+        case_files_count,
+        Path::new(&part4_dev)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "kit-out".into())
+    );
 
     let mut details = Map::new();
     details.insert(
@@ -1170,6 +1300,7 @@ fn cmd_verify(device: &str, image_dir_opt: Option<PathBuf>) -> Result<u8> {
         manifest_path.to_string_lossy().into_owned().into(),
     );
     details.insert("kit_version".into(), manifest.version.into());
+    details.insert("layout".into(), layout.into());
     details.insert("intact_files".into(), total_intact_files.into());
     details.insert("intact_symlinks".into(), total_intact_symlinks.into());
     details.insert("changed".into(), serde_json::to_value(&all_changed)?);
@@ -1219,8 +1350,10 @@ fn main() -> ExitCode {
             image_dir,
             devices,
             confirm,
-            no_wipe,
-        } => cmd_write(&image_dir, &devices, &confirm, !no_wipe),
+            wipe,
+            no_wipe: _,
+            only,
+        } => cmd_write(&image_dir, &devices, &confirm, wipe, only),
         Commands::Verify { device, image_dir } => cmd_verify(&device, image_dir),
     };
     match res {
@@ -1278,7 +1411,31 @@ mod tests {
         let cli_default =
             Cli::try_parse_from(["dfkit", "write", "/etc/dfnix/fieldkit", "/dev/sdb"]).unwrap();
         match cli_default.command {
-            Commands::Write { no_wipe, .. } => assert!(!no_wipe),
+            Commands::Write {
+                wipe,
+                no_wipe,
+                only,
+                ..
+            } => {
+                assert!(!wipe);
+                assert!(!no_wipe);
+                assert_eq!(only, None);
+            }
+            _ => panic!("expected Write"),
+        }
+
+        let cli_wipe = Cli::try_parse_from([
+            "dfkit",
+            "write",
+            "--wipe",
+            "/etc/dfnix/fieldkit",
+            "/dev/sdb",
+            "--confirm",
+            "sdb",
+        ])
+        .unwrap();
+        match cli_wipe.command {
+            Commands::Write { wipe, .. } => assert!(wipe),
             _ => panic!("expected Write"),
         }
 
@@ -1293,7 +1450,38 @@ mod tests {
         ])
         .unwrap();
         match cli_no_wipe.command {
-            Commands::Write { no_wipe, .. } => assert!(no_wipe),
+            Commands::Write { wipe, no_wipe, .. } => {
+                assert!(!wipe);
+                assert!(no_wipe);
+            }
+            _ => panic!("expected Write"),
+        }
+
+        assert!(Cli::try_parse_from([
+            "dfkit",
+            "write",
+            "--wipe",
+            "--no-wipe",
+            "/etc/dfnix/fieldkit",
+            "/dev/sdb",
+            "--confirm",
+            "sdb",
+        ])
+        .is_err());
+
+        let cli_only_win = Cli::try_parse_from([
+            "dfkit",
+            "write",
+            "--only",
+            "win",
+            "/etc/dfnix/fieldkit",
+            "/dev/sdb",
+            "--confirm",
+            "sdb",
+        ])
+        .unwrap();
+        match cli_only_win.command {
+            Commands::Write { only, .. } => assert_eq!(only, Some(KitLayout::Win)),
             _ => panic!("expected Write"),
         }
     }

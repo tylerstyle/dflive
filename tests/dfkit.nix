@@ -72,7 +72,7 @@ let
                   {
                     "number": 1,
                     "label": "KIT-WIN",
-                    "filesystem": "ntfs",
+                    "filesystem": "exfat",
                     "gpt_type_code": "0700",
                     "gpt_type_guid": "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7",
                     "gpt_partition_guid": "44464E49-5800-4B49-5400-000000000001",
@@ -154,10 +154,9 @@ let
             partx -u /dev/vda
             mkdir -p /mnt/p1 /mnt/p2 /mnt/p3 /mnt/p4
 
-            mkfs.ntfs -F -Q -L KIT-WIN /dev/vda1
-            ntfs-3g /dev/vda1 /mnt/p1
+            mkfs.exfat -L KIT-WIN -U 44464e49-5800-4b49-5400-000000000001 /dev/vda1
+            mount -t exfat /dev/vda1 /mnt/p1
             printf 'windows-checklist\r\n' > /mnt/p1/live-windows.txt
-            setfattr -v 0x00000001 -n system.ntfs_attrib_be /mnt/p1/live-windows.txt
             umount /mnt/p1
 
             mkfs.hfsplus -v KIT-MAC /dev/vda2
@@ -192,8 +191,8 @@ pkgs.testers.runNixOSTest {
 
   nodes.machine = {
     virtualisation.memorySize = 2048;
-    # 768 MiB virtual target stick (larger than both the 64 MiB fixture and the 612 MiB full fieldkit.img)
-    virtualisation.emptyDiskImages = [ 768 ];
+    # 768 MiB virtual target sticks
+    virtualisation.emptyDiskImages = [ 768 768 ];
     boot.kernelModules = [ "hfsplus" "exfat" ];
     environment.systemPackages = with pkgs; [
       dfkit
@@ -227,35 +226,60 @@ pkgs.testers.runNixOSTest {
         rc, out = machine.execute(f"dfkit write {kit_dir} /dev/vdb --confirm wrongname 2>&1")
         assert rc == 2, f"expected refusal exit 2, got {rc}: {out}"
 
-    with subtest("writes field-kit image, wipes and grows KIT-OUT, writes KIT-ID.json, and verifies read-back"):
-        # Pre-populate the target stick with residual data from a "previous case" across 700 MiB
+    with subtest("default write skips zeroing, keeps residual data, and records kit_out_zeroed=false"):
+        # Pre-populate /dev/vdb with residual data
         machine.succeed("(yes PREVIOUS-CASE-DATA || true) | head -c 700M > /dev/vdb && sync && blockdev --flushbufs /dev/vdb")
-        machine.succeed(f"dfkit write {kit_dir} /dev/vdb --confirm vdb")
-        # Partition 4 (KIT-OUT) must have grown well beyond its initial size in fieldkit.img
-        p4_bytes = int(machine.succeed("blockdev --getsize64 /dev/vdb4").strip())
-        assert p4_bytes > 100 * 1024 * 1024, f"expected KIT-OUT > 100 MiB on 768 MiB disk, got {p4_bytes}"
-
-        # Residual data from previous case must be completely wiped from KIT-OUT (/dev/vdb4)
+        out = machine.succeed(f"dfkit write {kit_dir} /dev/vdb --confirm vdb 2>&1")
+        assert "KIT-OUT not zeroed" in out, out
+        # Residual data must still be present in unallocated clusters of KIT-OUT
         residual_hits = int(machine.succeed("grep -a -c PREVIOUS-CASE-DATA /dev/vdb4 || true").strip())
-        assert residual_hits == 0, f"expected 0 occurrences of PREVIOUS-CASE-DATA on /dev/vdb4, got {residual_hits}"
+        assert residual_hits > 0, f"expected residual hits on unwiped stick, got {residual_hits}"
 
-        # Check KIT-ID.json on KIT-OUT
+        # Check KIT-OUT growth (partition 4 grew to fill the disk)
+        p4_bytes = int(machine.succeed("blockdev --getsize64 /dev/vdb4").strip())
+        assert p4_bytes > 100 * 1024 * 1024, f"expected KIT-OUT > 100 MiB, got {p4_bytes}"
+
+        # Verify KIT-ID.json records kit_out_zeroed: false, layout: full, and metadata
         machine.succeed("mkdir -p /mnt/kit-out && mount -t exfat -o ro /dev/vdb4 /mnt/kit-out")
-        kit_id = json.loads(machine.succeed("cat /mnt/kit-out/KIT-ID.json"))
         machine.succeed("test -f /mnt/kit-out/.metadata_never_index && test -f /mnt/kit-out/.fseventsd/no_log")
+        kit_id = json.loads(machine.succeed("cat /mnt/kit-out/KIT-ID.json"))
+        machine.succeed("umount /mnt/kit-out")
+        assert kit_id["kit_version"] == orig_meta["version"], kit_id
+        assert kit_id["image_sha256"] == orig_meta["image"]["sha256"], kit_id
+        assert kit_id["kit_out_zeroed"] is False, kit_id
+        assert kit_id["layout"] == "full", kit_id
+
+        # Hidden --no-wipe is accepted as a no-op
+        out_nowipe = machine.succeed(f"dfkit write {kit_dir} /dev/vdb --confirm vdb --no-wipe 2>&1")
+        assert "KIT-OUT not zeroed" in out_nowipe, out_nowipe
+
+    with subtest("--wipe zeroes KIT-OUT completely and records kit_out_zeroed=true"):
+        # Re-populate /dev/vdb with residual data
+        machine.succeed("(yes PREVIOUS-CASE-DATA || true) | head -c 700M > /dev/vdb && sync && blockdev --flushbufs /dev/vdb")
+        out_wipe = machine.succeed(f"dfkit write {kit_dir} /dev/vdb --confirm vdb --wipe 2>&1")
+        assert "Zeroing" in out_wipe, out_wipe
+        # Residual data from previous case must be completely wiped from KIT-OUT
+        residual_hits = int(machine.succeed("grep -a -c PREVIOUS-CASE-DATA /dev/vdb4 || true").strip())
+        assert residual_hits == 0, f"expected 0 occurrences after --wipe, got {residual_hits}"
+
+        # Verify KIT-ID.json records kit_out_zeroed: true and layout: full
+        machine.succeed("mount -t exfat -o ro /dev/vdb4 /mnt/kit-out")
+        machine.succeed("test -f /mnt/kit-out/.metadata_never_index && test -f /mnt/kit-out/.fseventsd/no_log")
+        kit_id = json.loads(machine.succeed("cat /mnt/kit-out/KIT-ID.json"))
         machine.succeed("umount /mnt/kit-out")
         assert kit_id["kit_version"] == orig_meta["version"], kit_id
         assert kit_id["image_sha256"] == orig_meta["image"]["sha256"], kit_id
         assert kit_id["kit_out_zeroed"] is True, kit_id
+        assert kit_id["layout"] == "full", kit_id
 
-        # Check dfkit verify passes (exit 0)
+        # dfkit verify passes and suggests dfcollect
         out = machine.succeed(f"dfkit verify /dev/vdb {kit_dir}")
         assert "Field-kit verification PASSED" in out, out
         assert "dfcollect files" in out, out
 
-    with subtest("detects planted file and modified tool file, while tolerating allowlisted OS noise"):
-        # 1. Add allowlisted OS noise on KIT-WIN (Partition 1, NTFS) -> exit 0, [OS-ADDED]
-        machine.succeed("blockdev --setrw /dev/vdb /dev/vdb1 && mkdir -p /mnt/win && ntfs-3g /dev/vdb1 /mnt/win")
+    with subtest("detects planted file and modified tool file, while tolerating allowlisted OS noise on exFAT"):
+        # 1. Add allowlisted OS noise on KIT-WIN (Partition 1, exFAT) -> exit 0, [OS-ADDED]
+        machine.succeed("blockdev --setrw /dev/vdb /dev/vdb1 && mkdir -p /mnt/win && mount -t exfat /dev/vdb1 /mnt/win")
         machine.succeed("mkdir -p '/mnt/win/System Volume Information' && printf 'noise' > '/mnt/win/System Volume Information/WPSettings.dat'")
         machine.succeed("umount /mnt/win")
 
@@ -263,7 +287,7 @@ pkgs.testers.runNixOSTest {
         assert "[OS-ADDED] KIT-WIN: System Volume Information/WPSettings.dat" in out_noise_only, out_noise_only
 
         # 2. Plant an unexpected file on KIT-WIN (`version.dll`) -> exit 5, [UNEXPECTED]
-        machine.succeed("blockdev --setrw /dev/vdb /dev/vdb1 && ntfs-3g /dev/vdb1 /mnt/win")
+        machine.succeed("blockdev --setrw /dev/vdb /dev/vdb1 && mount -t exfat /dev/vdb1 /mnt/win")
         machine.succeed("printf 'hijack' > /mnt/win/version.dll")
         machine.succeed("umount /mnt/win")
 
@@ -273,7 +297,7 @@ pkgs.testers.runNixOSTest {
         assert "[OS-ADDED] KIT-WIN: System Volume Information/WPSettings.dat" in out_planted, out_planted
 
         # Remove planted file -> verify returns to exit 0
-        machine.succeed("blockdev --setrw /dev/vdb /dev/vdb1 && ntfs-3g /dev/vdb1 /mnt/win")
+        machine.succeed("blockdev --setrw /dev/vdb /dev/vdb1 && mount -t exfat /dev/vdb1 /mnt/win")
         machine.succeed("rm /mnt/win/version.dll")
         machine.succeed("umount /mnt/win")
         machine.succeed(f"dfkit verify /dev/vdb {kit_dir}")
@@ -288,14 +312,71 @@ pkgs.testers.runNixOSTest {
         assert "[CHANGED] KIT-LNX: live-linux.md" in out_tampered, out_tampered
         assert "[OS-ADDED] KIT-WIN: System Volume Information/WPSettings.dat" in out_tampered, out_tampered
 
-    with subtest("audit log contains fieldkit_write and fieldkit_verify records"):
+    with subtest("--only win writes sparse GPT, handles reused full-kit sticks, and detects layout mismatch"):
+        # 1. Write --only win to empty /dev/vdc
+        machine.succeed(f"dfkit write {kit_dir} /dev/vdc --confirm vdc --only win 2>&1")
+        machine.succeed("test -b /dev/vdc1 && test -b /dev/vdc4")
+        machine.succeed("test ! -e /dev/vdc2 && test ! -e /dev/vdc3")
+        sg_check = machine.succeed("sgdisk -v /dev/vdc")
+        assert "No problems found" in sg_check, sg_check
+
+        out_v = machine.succeed(f"dfkit verify /dev/vdc {kit_dir} 2>&1")
+        assert "Detected field-kit layout: win" in out_v, out_v
+        assert "skipping unwritten partitions 2-3" in out_v, out_v
+        assert "Field-kit verification PASSED" in out_v, out_v
+
+        # 2. Reused stick test: write a full kit to /dev/vdc first
+        machine.succeed(f"dfkit write {kit_dir} /dev/vdc --confirm vdc 2>&1")
+        machine.succeed("test -b /dev/vdc1 && test -b /dev/vdc2 && test -b /dev/vdc3 && test -b /dev/vdc4")
+
+        # Now write --only win over the existing full kit on /dev/vdc
+        machine.succeed(f"dfkit write {kit_dir} /dev/vdc --confirm vdc --only win 2>&1")
+
+        # Partitions 1 and 4 exist; partitions 2 and 3 do not exist
+        machine.succeed("test -b /dev/vdc1 && test -b /dev/vdc4")
+        machine.succeed("test ! -e /dev/vdc2 && test ! -e /dev/vdc3")
+
+        # Verify sgdisk reports no problems (backup GPT at disk end is valid and matches primary)
+        sg_check = machine.succeed("sgdisk -v /dev/vdc")
+        assert "No problems found" in sg_check, sg_check
+
+        # sgdisk -p must list entries 1 and 4 only, with entries 2 and 3 absent
+        sg_p = machine.succeed("sgdisk -p /dev/vdc")
+        assert "KIT-WIN" in sg_p and "KIT-OUT" in sg_p, sg_p
+        assert "KIT-MAC" not in sg_p and "KIT-LNX" not in sg_p, sg_p
+
+        # Verify KIT-ID.json records layout: win
+        machine.succeed("mkdir -p /mnt/vdc4 && mount -t exfat -o ro /dev/vdc4 /mnt/vdc4")
+        kit_id_win = json.loads(machine.succeed("cat /mnt/vdc4/KIT-ID.json"))
+        machine.succeed("umount /mnt/vdc4")
+        assert kit_id_win["layout"] == "win", kit_id_win
+
+        # Verify dfkit verify passes on the reused stick with layout win
+        out_v = machine.succeed(f"dfkit verify /dev/vdc {kit_dir} 2>&1")
+        assert "Detected field-kit layout: win" in out_v, out_v
+        assert "skipping unwritten partitions 2-3" in out_v, out_v
+        assert "Field-kit verification PASSED" in out_v, out_v
+
+        # 3. Layout mismatch test: manually add partition 2 to /dev/vdc -> verify must fail with layout mismatch
+        machine.succeed("sgdisk -n 2:0:+16M -t 2:AF00 -c 2:KIT-MAC /dev/vdc && partx -u /dev/vdc")
+        rc, out_mismatch = machine.execute(f"dfkit verify /dev/vdc {kit_dir} 2>&1")
+        assert rc != 0, f"expected verify failure on layout mismatch, got {rc}: {out_mismatch}"
+        assert "Layout mismatch" in out_mismatch, out_mismatch
+
+    with subtest("audit log contains fieldkit_write and fieldkit_verify records with layout and wipe details"):
         lines = [json.loads(l) for l in machine.succeed("cat /run/dfnix/audit.jsonl").splitlines() if l.strip()]
         actions = [(r["action"], r["outcome"]) for r in lines]
         assert ("fieldkit_write", "refused") in actions, actions
         assert ("fieldkit_write", "ok") in actions, actions
         assert ("fieldkit_verify", "ok") in actions, actions
         assert ("fieldkit_verify", "error") in actions, actions
-        write_ok = [r for r in lines if r["action"] == "fieldkit_write" and r["outcome"] == "ok"][0]
-        assert write_ok["details"]["kit_out_zeroed"] is True, write_ok
+
+        write_oks = [r for r in lines if r["action"] == "fieldkit_write" and r["outcome"] == "ok"]
+        # Default write records kit_out_zeroed: False
+        assert any(r["details"].get("kit_out_zeroed") is False and r["details"].get("layout") == "full" for r in write_oks), write_oks
+        # --wipe write records kit_out_zeroed: True
+        assert any(r["details"].get("kit_out_zeroed") is True and r["details"].get("layout") == "full" for r in write_oks), write_oks
+        # --only win write records layout: win
+        assert any(r["details"].get("layout") == "win" for r in write_oks), write_oks
   '';
 }

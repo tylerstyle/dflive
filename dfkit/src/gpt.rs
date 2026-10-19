@@ -175,6 +175,42 @@ pub fn validate_fieldkit_gpt(gpt: &GptTable) -> Result<()> {
     Ok(())
 }
 
+/// Validate that a parsed GPT matches the expected field-kit layout:
+/// - "full": partitions 1, 2, 3, and 4 must all be present.
+/// - "win": partitions 1 and 4 must be present; partitions 2 and 3 must be absent.
+pub fn validate_layout_gpt(gpt: &GptTable, layout: &str) -> Result<()> {
+    let has_p1 = gpt.partition(1).is_some();
+    let has_p2 = gpt.partition(2).is_some();
+    let has_p3 = gpt.partition(3).is_some();
+    let has_p4 = gpt.partition(4).is_some();
+
+    ensure!(has_p1, "GPT is missing partition 1 (KIT-WIN)");
+    ensure!(has_p4, "GPT is missing partition 4 (KIT-OUT)");
+
+    match layout {
+        "win" => {
+            if has_p2 || has_p3 {
+                bail!(
+                    "Layout mismatch: KIT-ID.json specifies layout 'win', but GPT has unexpected partition(s): {}{}",
+                    if has_p2 { "partition 2 (KIT-MAC) " } else { "" },
+                    if has_p3 { "partition 3 (KIT-LNX)" } else { "" }
+                );
+            }
+        }
+        "full" => {
+            if !has_p2 || !has_p3 {
+                bail!(
+                    "Layout mismatch: KIT-ID.json specifies full layout, but GPT is missing partition(s): {}{}",
+                    if !has_p2 { "partition 2 (KIT-MAC) " } else { "" },
+                    if !has_p3 { "partition 3 (KIT-LNX)" } else { "" }
+                );
+            }
+        }
+        other => bail!("Unsupported field-kit layout '{other}' in KIT-ID.json"),
+    }
+    Ok(())
+}
+
 /// Compute the partition device node path on Linux for a whole disk path and 1-based partition number.
 /// Disks ending in a digit (`nvme0n1`, `mmcblk0`, `loop0`) use `<disk>p<N>`;
 /// disks ending in a letter (`sdb`, `vdb`) use `<disk><N>`.
@@ -308,5 +344,31 @@ mod tests {
         assert_eq!(partition_dev_path("/dev/nvme0n1", 4), "/dev/nvme0n1p4");
         assert_eq!(partition_dev_path("/dev/mmcblk0", 2), "/dev/mmcblk0p2");
         assert_eq!(partition_dev_path("/dev/loop0", 3), "/dev/loop0p3");
+    }
+
+    #[test]
+    fn validate_layout_gpt_checks_partitions_against_layout() {
+        let raw = synthetic_fieldkit_gpt();
+        let gpt_full = read_gpt(Cursor::new(&raw)).unwrap();
+
+        // Full layout on full GPT passes
+        assert!(validate_layout_gpt(&gpt_full, "full").is_ok());
+        // Win layout on full GPT fails because p2 and p3 exist
+        assert!(validate_layout_gpt(&gpt_full, "win").is_err());
+
+        // Construct sparse GPT with p1 and p4 only
+        let mut sparse_partitions = gpt_full.partitions.clone();
+        sparse_partitions.retain(|p| p.number == 1 || p.number == 4);
+        let gpt_win = GptTable {
+            partitions: sparse_partitions,
+            ..gpt_full.clone()
+        };
+
+        // Win layout on win GPT passes
+        assert!(validate_layout_gpt(&gpt_win, "win").is_ok());
+        // Full layout on win GPT fails because p2 and p3 are missing
+        assert!(validate_layout_gpt(&gpt_win, "full").is_err());
+        // Unsupported layout fails
+        assert!(validate_layout_gpt(&gpt_win, "unknown").is_err());
     }
 }
