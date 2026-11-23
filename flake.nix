@@ -27,7 +27,7 @@
           # The field kit's binaries
           dflive-static = pkgs.pkgsStatic.callPackage ./package.nix { };
           dflive-aarch64-static = pkgs.pkgsCross.aarch64-multiplatform-musl.pkgsStatic.callPackage ./package.nix { };
-          dflive-windows = pkgs.pkgsCross.mingwW64.callPackage ./package.nix { };
+          dflive-windows = pkgs.pkgsCross.mingw-msvcrt-x86_64.callPackage ./package.nix { };
         };
 
         checks = pkgs.lib.optionalAttrs (system == "x86_64-linux") {

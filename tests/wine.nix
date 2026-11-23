@@ -6,7 +6,7 @@
 #
 #   nix-build tests/wine.nix
 { pkgs ? import <nixpkgs> { }
-, dflive ? pkgs.pkgsCross.mingwW64.callPackage ../package.nix { }
+, dflive ? pkgs.pkgsCross.mingw-msvcrt-x86_64.callPackage ../package.nix { }
 }:
 
 pkgs.runCommand "dflive-wine"
