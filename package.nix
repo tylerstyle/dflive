@@ -4,7 +4,7 @@
 
 rustPlatform.buildRustPackage {
   pname = "dflive";
-  version = "0.1.0";
+  version = "0.1.1";
 
   # Exclude `dfkit` from `dflive`'s source and workspace members: `dfkit` depends on
   # the Linux-only sibling `../../dfcore` crate, which is not in `dflive`'s sandbox

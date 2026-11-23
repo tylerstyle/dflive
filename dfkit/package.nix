@@ -36,7 +36,7 @@ let
 in
 rustPlatform.buildRustPackage {
   pname = "dfkit";
-  version = "0.2.0";
+  version = "0.2.1";
 
   inherit src;
   sourceRoot = "dfkit-src/dflive";
